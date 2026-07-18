@@ -51,7 +51,10 @@ def _load_classifiers() -> dict:
     if not path.exists():
         _CLASSIFIERS = {}
     else:
-        _CLASSIFIERS = joblib.load(path)
+        try:
+            _CLASSIFIERS = joblib.load(path)
+        except Exception:
+            _CLASSIFIERS = {}
     return _CLASSIFIERS
 
 
@@ -87,7 +90,7 @@ _ATTR_DEFAULTS = {
     "pitch_control":         {"thresh": 1.5, "scale": 0.35, "max": 10.0},
     "pitch_movement":        {"thresh": 1.5, "scale": 0.33, "max": 10.0},
     "pitching_clutch":       {"thresh": 1.0, "scale": 0.40, "max": 14.0},
-    "stamina":               {"thresh": 1.5, "scale": 0.45, "max": 18.0},
+    "stamina":               {"thresh": 3.0, "scale": 0.20, "max": 6.0},
     "k_per_9":               {"thresh": 1.0, "scale": 0.35, "max": 10.0},
     "hr_per_9":              {"thresh": 1.0, "scale": 0.35, "max": 10.0},
     "k_per_9_r":             {"thresh": 1.0, "scale": 0.35, "max": 10.0},
@@ -240,7 +243,10 @@ def predict_attr_delta(
 
     # 3. Calibrated magnitude
     cal = _get_cal(attr, game_year, ovr)
-    if has_data and abs(gap) >= cal["thresh"]:
+    # Stamina: skip entirely when no stat data (missing IP causes false gaps)
+    if attr == "stamina" and not has_data:
+        predicted = 0.0
+    elif has_data and abs(gap) >= cal["thresh"]:
         predicted = gap * cal["scale"]
         predicted = max(-cal["max"], min(cal["max"], predicted))
     elif not has_data and abs(gap) >= 2.0:

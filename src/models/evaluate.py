@@ -11,13 +11,6 @@ import json
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    mean_absolute_error,
-    roc_auc_score,
-    r2_score,
-)
 
 from src.config import PROCESSED_DIR
 from src.models.train import (
@@ -74,6 +67,11 @@ def precision_at_k(y_true: np.ndarray, y_score: np.ndarray, k: int = 20) -> floa
     return float(y_true[top_idx].mean())
 
 
+def _sklearn_metrics():
+    from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, roc_auc_score, r2_score
+    return accuracy_score, f1_score, mean_absolute_error, roc_auc_score, r2_score
+
+
 def evaluate_fold(train: pd.DataFrame, test: pd.DataFrame) -> dict:
     """Evaluate the unified pipeline on one fold.
 
@@ -85,6 +83,7 @@ def evaluate_fold(train: pd.DataFrame, test: pd.DataFrame) -> dict:
       - ovr_delta_mae: player-level OVR delta error
       - precision_at_20: top 20 investment targets
     """
+    accuracy_score, f1_score, mean_absolute_error, roc_auc_score, r2_score = _sklearn_metrics()
     metrics = {}
 
     # ── Train calibration + classifier on this fold ──────────────────────
@@ -209,7 +208,11 @@ def run_backtest(df: pd.DataFrame | None = None) -> dict:
     if df is None:
         path = PROCESSED_DIR / "training_examples.parquet"
         if path.exists():
-            df = pd.read_parquet(path)
+            try:
+                df = pd.read_parquet(path)
+            except (ImportError, ModuleNotFoundError):
+                from src.features.engineering import build_training_dataset
+                df = build_training_dataset()
         else:
             from src.features.engineering import build_training_dataset
             df = build_training_dataset()

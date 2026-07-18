@@ -236,9 +236,10 @@ def project_pitcher_attribute(attr: str, stats: dict, coeffs: dict | None = None
         if gs < 1:
             gs = 1.0
         ip_per_gs = ip / gs
-        # Reasonable stamina: baseline 45, +1.8 per IP/GS.  League avg starter
-        # (~5.5 IP/start) ≈ 55, relievers (~1 IP) ≈ 47, aces (~7 IP) ≈ 58.
-        return clip_rating(45.0 + ip_per_gs * 1.8)
+        # Stamina: flattened slope because stamina upgrades are rare.
+        # Baseline 48, +1.0 per IP/GS — keeps projections ~48-55 range.
+        # League avg starter (~5.5 IP/start) ≈ 53, relievers (~1 IP) ≈ 49.
+        return clip_rating(48.0 + ip_per_gs * 1.0)
 
     # k/9 variants (splits vs L/R)
     if attr in ("k_per_9_r", "k_per_9_l"):

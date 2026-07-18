@@ -11,7 +11,7 @@ try:
     from lightgbm import LGBMClassifier
 except ImportError:
     LGBMClassifier = None  # Graceful fallback on platforms without lightgbm
-from sklearn.linear_model import Ridge
+
 
 from src.config import HITTER_ATTRS, MODELS_DIR, PITCHER_ATTRS, TIER_ORDER, ALIAS_MAP
 from src.db import ModelMetrics, init_db
@@ -187,6 +187,11 @@ def train_change_classifier(df: pd.DataFrame) -> dict:
 
 def _fit_ovr_weights(df: pd.DataFrame) -> dict:
     """Estimate attribute contribution weights to OVR by position."""
+    try:
+        from sklearn.linear_model import Ridge
+    except ImportError:
+        logger.warning("sklearn not available; skipping OVR weight fitting.")
+        return {}
     weights = {}
     for pos, group in df.groupby("position"):
         if len(group) < 20 or not pos:
@@ -228,7 +233,12 @@ def train_all(training_path: Path | None = None) -> dict:
         from src.features.engineering import build_training_dataset
         df = build_training_dataset()
     else:
-        df = pd.read_parquet(path)
+        try:
+            df = pd.read_parquet(path)
+        except (ImportError, ModuleNotFoundError):
+            logger.warning("Parquet engine not available; rebuilding training dataset.")
+            from src.features.engineering import build_training_dataset
+            df = build_training_dataset()
 
     if df.empty:
         raise ValueError("No training data available. Run backfill first.")

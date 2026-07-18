@@ -13,9 +13,7 @@ from pydantic import BaseModel
 from src.db import AttributeChange, CardSnapshot, ModelMetrics, Prediction, init_db, safe_init_db
 from src.features.engineering import build_live_features
 from src.ingest.cards import fetch_live_series_cards, link_cards_to_mlb_ids
-from src.models.evaluate import run_backtest
 from src.models.predict import is_roster_update_today, run_predictions
-from src.models.train import train_all
 
 app = FastAPI(
     title="MLB The Show 26 Roster Update Predictor",
@@ -357,6 +355,11 @@ def refresh_predictions(req: RefreshRequest):
 
 @app.post("/train")
 def train_models():
+    from src.models.train import train_all
     result = train_all()
-    backtest = run_backtest()
+    try:
+        from src.models.evaluate import run_backtest
+        backtest = run_backtest()
+    except Exception as e:
+        backtest = {"error": str(e)}
     return {"training": result, "backtest": backtest}
