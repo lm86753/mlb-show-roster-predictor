@@ -113,30 +113,30 @@ def _ovr_weight(attr: str, is_hitter: bool) -> float:
     return weights.get(attr, 0.02)
 
 _ATTR_DEFAULTS = {
-    "contact_left":          {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    "contact_right":         {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    "power_left":            {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    "power_right":           {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    "plate_vision":          {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "plate_discipline":      {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    "batting_clutch":        {"thresh": 2.0, "scale": 0.20, "max": 5.0},
-    "speed":                 {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "contact_left":          {"thresh": 2.0, "scale": 0.25, "max": 5.0},
+    "contact_right":         {"thresh": 2.0, "scale": 0.25, "max": 5.0},
+    "power_left":            {"thresh": 2.0, "scale": 0.25, "max": 5.0},
+    "power_right":           {"thresh": 2.0, "scale": 0.25, "max": 5.0},
+    "plate_vision":          {"thresh": 1.5, "scale": 0.30, "max": 5.0},
+    "plate_discipline":      {"thresh": 2.0, "scale": 0.22, "max": 5.0},
+    "batting_clutch":        {"thresh": 2.0, "scale": 0.22, "max": 5.0},
+    "speed":                 {"thresh": 2.0, "scale": 0.22, "max": 4.0},
     "fielding_ability":      {"thresh": 3.0, "scale": 0.15, "max": 3.0},
     "arm_strength":          {"thresh": 3.0, "scale": 0.15, "max": 3.0},
     "arm_accuracy":          {"thresh": 3.0, "scale": 0.15, "max": 3.0},
     "reaction_time":         {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    "pitch_velocity":        {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "pitch_control":         {"thresh": 2.0, "scale": 0.22, "max": 5.0},
-    "pitch_movement":        {"thresh": 2.0, "scale": 0.22, "max": 5.0},
-    "pitching_clutch":       {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "pitch_velocity":        {"thresh": 1.5, "scale": 0.28, "max": 5.0},
+    "pitch_control":         {"thresh": 2.0, "scale": 0.25, "max": 5.0},
+    "pitch_movement":        {"thresh": 2.0, "scale": 0.25, "max": 5.0},
+    "pitching_clutch":       {"thresh": 1.5, "scale": 0.28, "max": 5.0},
     "stamina":               {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    "k_per_9":               {"thresh": 1.5, "scale": 0.22, "max": 5.0},
-    "hr_per_9":              {"thresh": 1.5, "scale": 0.22, "max": 5.0},
-    "k_per_9_r":             {"thresh": 1.5, "scale": 0.22, "max": 5.0},
-    "k_per_9_l":             {"thresh": 1.5, "scale": 0.22, "max": 5.0},
-    "h_per_9_r":             {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "h_per_9":               {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "bb_per_9":              {"thresh": 1.5, "scale": 0.22, "max": 5.0},
+    "k_per_9":               {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "hr_per_9":              {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "k_per_9_r":             {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "k_per_9_l":             {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "h_per_9_r":             {"thresh": 1.5, "scale": 0.28, "max": 5.0},
+    "h_per_9":               {"thresh": 1.5, "scale": 0.28, "max": 5.0},
+    "bb_per_9":              {"thresh": 1.5, "scale": 0.25, "max": 5.0},
 }
 
 
@@ -288,9 +288,9 @@ def predict_attr_delta(
     elif has_data and abs(gap) >= cal["thresh"]:
         predicted = gap * cal["scale"]
         predicted = max(-cal["max"], min(cal["max"], predicted))
-    elif not has_data and abs(gap) >= 3.0:
-        predicted = gap * 0.08
-        predicted = max(-2.0, min(2.0, predicted))
+    elif not has_data and abs(gap) >= 2.5:
+        predicted = gap * 0.10
+        predicted = max(-3.0, min(3.0, predicted))
     else:
         predicted = 0.0
 
@@ -537,7 +537,7 @@ def expected_stub_profit(
 ) -> dict:
     new_ovr = int(current_ovr + round(predicted_delta))
     new_ovr = max(0, min(99, new_ovr))
-    tiers = [(0, 25), (65, 100), (75, 300), (85, 1000), (90, 5000), (95, 10000)]
+    tiers = [(0, 25), (65, 100), (75, 300), (80, 600), (85, 1000), (90, 5000), (92, 10000), (94, 25000), (95, 50000), (97, 100000)]
     cur_qs = max((v for k, v in tiers if current_ovr >= k), default=0)
     new_qs = max((v for k, v in tiers if new_ovr >= k), default=0)
     cost = buy_price if buy_price else cur_qs
