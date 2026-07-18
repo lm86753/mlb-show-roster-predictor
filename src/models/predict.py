@@ -204,35 +204,35 @@ def _ovr_weight(attr: str, is_hitter: bool) -> float:
     return weights.get(attr, 0.02)
 
 _ATTR_DEFAULTS = {
-    # Hitter core: contact/power get higher scale (gap→delta translation)
-    "contact_left":          {"thresh": 1.5, "scale": 0.40, "max": 7.0},
-    "contact_right":         {"thresh": 1.5, "scale": 0.40, "max": 7.0},
-    "power_left":            {"thresh": 1.5, "scale": 0.40, "max": 7.0},
-    "power_right":           {"thresh": 1.5, "scale": 0.40, "max": 7.0},
+    # Hitter core
+    "contact_left":          {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "contact_right":         {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "power_left":            {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "power_right":           {"thresh": 2.0, "scale": 0.20, "max": 4.0},
     # Hitter secondary
-    "plate_vision":          {"thresh": 1.0, "scale": 0.45, "max": 6.0},
-    "plate_discipline":      {"thresh": 1.5, "scale": 0.35, "max": 6.0},
-    "batting_clutch":        {"thresh": 1.5, "scale": 0.35, "max": 6.0},
-    "speed":                 {"thresh": 1.5, "scale": 0.35, "max": 5.0},
-    # Fielding (traditionally slower to change)
-    "fielding_ability":      {"thresh": 2.0, "scale": 0.25, "max": 4.0},
-    "arm_strength":          {"thresh": 2.0, "scale": 0.25, "max": 4.0},
-    "arm_accuracy":          {"thresh": 2.0, "scale": 0.25, "max": 4.0},
-    "reaction_time":         {"thresh": 2.0, "scale": 0.25, "max": 4.0},
+    "plate_vision":          {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "plate_discipline":      {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "batting_clutch":        {"thresh": 2.0, "scale": 0.20, "max": 5.0},
+    "speed":                 {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    # Fielding
+    "fielding_ability":      {"thresh": 3.0, "scale": 0.15, "max": 3.0},
+    "arm_strength":          {"thresh": 3.0, "scale": 0.15, "max": 3.0},
+    "arm_accuracy":          {"thresh": 3.0, "scale": 0.15, "max": 3.0},
+    "reaction_time":         {"thresh": 3.0, "scale": 0.15, "max": 3.0},
     # Pitcher core
-    "pitch_velocity":        {"thresh": 1.0, "scale": 0.40, "max": 6.0},
-    "pitch_control":         {"thresh": 1.5, "scale": 0.38, "max": 7.0},
-    "pitch_movement":        {"thresh": 1.5, "scale": 0.38, "max": 7.0},
-    "pitching_clutch":       {"thresh": 1.0, "scale": 0.40, "max": 6.0},
-    "stamina":               {"thresh": 2.0, "scale": 0.25, "max": 4.0},
+    "pitch_velocity":        {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "pitch_control":         {"thresh": 2.0, "scale": 0.22, "max": 5.0},
+    "pitch_movement":        {"thresh": 2.0, "scale": 0.22, "max": 5.0},
+    "pitching_clutch":       {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "stamina":               {"thresh": 3.0, "scale": 0.15, "max": 3.0},
     # Pitcher rate stats
-    "k_per_9":               {"thresh": 1.0, "scale": 0.38, "max": 6.0},
-    "hr_per_9":              {"thresh": 1.0, "scale": 0.38, "max": 6.0},
-    "k_per_9_r":             {"thresh": 1.0, "scale": 0.38, "max": 6.0},
-    "k_per_9_l":             {"thresh": 1.0, "scale": 0.38, "max": 6.0},
-    "h_per_9_r":             {"thresh": 1.0, "scale": 0.40, "max": 6.0},
-    "h_per_9":               {"thresh": 1.0, "scale": 0.40, "max": 6.0},
-    "bb_per_9":              {"thresh": 1.0, "scale": 0.38, "max": 6.0},
+    "k_per_9":               {"thresh": 1.5, "scale": 0.22, "max": 5.0},
+    "hr_per_9":              {"thresh": 1.5, "scale": 0.22, "max": 5.0},
+    "k_per_9_r":             {"thresh": 1.5, "scale": 0.22, "max": 5.0},
+    "k_per_9_l":             {"thresh": 1.5, "scale": 0.22, "max": 5.0},
+    "h_per_9_r":             {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "h_per_9":               {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "bb_per_9":              {"thresh": 1.5, "scale": 0.22, "max": 5.0},
 }
 
 
@@ -262,20 +262,8 @@ def _get_cal(attr: str, game_year: int = 26, ovr: int = 75) -> dict:
 
 
 def _ovr_factor(ovr: int) -> float:
-    """Scale max delta for low-OVR cards.
-
-    Tier-aware: elite cards (OVR 90+) barely move; mid-tier has moderate
-    headroom; low-OVR cards have substantial room to grow.
-    """
-    if ovr >= 90:
-        return 1.0
-    if ovr >= 85:
-        return 1.0 + (90 - ovr) / 90 * 0.5  # 1.0–1.03
-    if ovr >= 75:
-        return 1.03 + (85 - ovr) / 85 * 0.5  # 1.03–1.09
-    if ovr >= 65:
-        return 1.09 + (75 - ovr) / 75 * 0.6  # 1.09–1.17
-    return 1.17 + (65 - ovr) / 65 * 1.5       # up to ~2.67 at OVR 0
+    """Scale max delta for low-OVR cards — modest room to grow."""
+    return 1.0 + max(0, (99 - ovr) / 99) * 0.75
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -404,17 +392,17 @@ def predict_attr_delta(
     elif has_data and abs(gap) >= cal["thresh"]:
         predicted = gap * cal["scale"]
         predicted = max(-cal["max"], min(cal["max"], predicted))
-    elif not has_data and abs(gap) >= 1.5:
-        predicted = gap * 0.20
-        predicted = max(-4.0, min(4.0, predicted))
+    elif not has_data and abs(gap) >= 2.5:
+        predicted = gap * 0.10
+        predicted = max(-3.0, min(3.0, predicted))
     else:
         predicted = 0.0
 
-    # 4. Trend overlay — amplify when recent history matches direction
-    if mlb_id and abs(predicted) > 0.3:
+    # 4. Simple trend overlay
+    if mlb_id and abs(predicted) > 0.5:
         trend = _get_player_trend(mlb_id, attr)
-        if abs(trend) > 0.3 and np.sign(trend) == np.sign(predicted):
-            predicted += trend * 0.30
+        if abs(trend) > 0.5 and np.sign(trend) == np.sign(predicted):
+            predicted += trend * 0.20
             predicted = max(-cal["max"], min(cal["max"], predicted))
 
     return predicted, prob, round(gap, 1)
@@ -551,10 +539,10 @@ def aggregate_player_predictions(attr_df: pd.DataFrame) -> pd.DataFrame:
         return 0.0
 
     ovr = grouped["current_ovr"]
-    base_mult = 2.5 - 0.8 * (ovr / 99.0)
+    base_mult = 1.5 - 0.3 * (ovr / 99.0)
     boost = ovr.apply(_tier_boost)
-    grouped["ovr_mult"] = (base_mult + boost).clip(1.0, 3.5)
-    grouped["predicted_ovr_delta"] = (grouped["weighted_sum"] * grouped["ovr_mult"]).clip(-15.0, 15.0)
+    grouped["ovr_mult"] = (base_mult + boost).clip(1.0, 2.5)
+    grouped["predicted_ovr_delta"] = (grouped["weighted_sum"] * grouped["ovr_mult"]).clip(-8.0, 8.0)
 
     # ── Directional probabilities (logistic, delta→probability) ──────────
     z = grouped["predicted_ovr_delta"] / 2.0
