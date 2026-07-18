@@ -5,9 +5,9 @@ venv/
 .env
 data/raw/
 data/processed/
-data/models/
 data/cache/
 data/card_images/
+data/card_images_real/
 data/*.db
 *.parquet
 .pytest_cache/

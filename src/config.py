@@ -1,10 +1,21 @@
+import os
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
+
+_is_vercel = os.environ.get("VERCEL") == "1"
+
+if _is_vercel:
+    DATA_DIR = Path("/tmp") / "data"
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Model files live in the project (read-only, committed to git)
+    MODELS_DIR = PROJECT_ROOT / "data" / "models"
+else:
+    DATA_DIR = PROJECT_ROOT / "data"
+    MODELS_DIR = DATA_DIR / "models"
+
 RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
-MODELS_DIR = DATA_DIR / "models"
 CACHE_DIR = DATA_DIR / "cache"
 DB_PATH = DATA_DIR / "predictor.db"
 

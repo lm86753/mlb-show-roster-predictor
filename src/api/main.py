@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from src.db import AttributeChange, CardSnapshot, ModelMetrics, Prediction, init_db
+from src.db import AttributeChange, CardSnapshot, ModelMetrics, Prediction, init_db, safe_init_db
 from src.features.engineering import build_live_features
 from src.ingest.cards import fetch_live_series_cards, link_cards_to_mlb_ids
 from src.models.evaluate import run_backtest
@@ -56,12 +56,19 @@ def get_card_image(card_uuid: str):
             if f.exists():
                 from fastapi.responses import FileResponse
                 return FileResponse(str(f), media_type="image/png")
-    raise HTTPException(404, "Card image not found")
+    from fastapi.responses import Response
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="400" height="560">
+      <rect width="400" height="560" fill="#1a1a2e" rx="12"/>
+      <text x="200" y="280" text-anchor="middle" fill="#666" font-family="sans-serif" font-size="24">No Image</text>
+    </svg>'''
+    return Response(content=svg, media_type="image/svg+xml")
 
 
 @app.get("/dashboard")
 def get_dashboard(horizon_days: int = Query(1, ge=1, le=30)):
-    Session = init_db()
+    Session = safe_init_db()
+    if Session is None:
+        return {"count": 0, "predictions": [], "update_status": {"latest": None, "days_since": None, "days_until": None}}
     with Session() as session:
         predictions = (
             session.query(Prediction)
@@ -146,7 +153,9 @@ def get_predictions(
     limit: int = Query(50, ge=1, le=500),
     min_upgrade_prob: float = Query(0.0, ge=0.0, le=1.0),
 ):
-    Session = init_db()
+    Session = safe_init_db()
+    if Session is None:
+        return {"count": 0, "predictions": []}
     with Session() as session:
         q = (
             session.query(Prediction)
@@ -177,7 +186,9 @@ def get_predictions(
 
 @app.get("/player/{card_uuid}")
 def get_player(card_uuid: str, horizon_days: int = 1):
-    Session = init_db()
+    Session = safe_init_db()
+    if Session is None:
+        raise HTTPException(503, "Database not available")
     with Session() as session:
         p = (
             session.query(Prediction)
@@ -204,7 +215,9 @@ def get_player(card_uuid: str, horizon_days: int = 1):
 
 @app.get("/accuracy")
 def get_accuracy():
-    Session = init_db()
+    Session = safe_init_db()
+    if Session is None:
+        return {"metrics": []}
     with Session() as session:
         metrics = session.query(ModelMetrics).order_by(ModelMetrics.created_at.desc()).limit(50).all()
         return {
@@ -226,7 +239,9 @@ def player_search(q: str = Query(..., min_length=1, description="Player name sea
     Search for players by name. Returns matching players with their
     latest prediction data (T-1 horizon by default).
     """
-    Session = init_db()
+    Session = safe_init_db()
+    if Session is None:
+        return {"query": q, "count": 0, "results": []}
     with Session() as session:
         # Find distinct players matching the name
         players = (
@@ -264,7 +279,9 @@ def player_trend(mlb_id: int):
     Returns a dict keyed with attribute_name -> list of recent changes
     (most recent first), each with rating_before, rating_after, delta, update_date.
     """
-    Session = init_db()
+    Session = safe_init_db()
+    if Session is None:
+        raise HTTPException(503, "Database not available")
     with Session() as session:
         # Get all attribute changes for this player, ordered most recent first
         changes = (

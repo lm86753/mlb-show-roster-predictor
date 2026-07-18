@@ -7,7 +7,10 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMClassifier
+try:
+    from lightgbm import LGBMClassifier
+except ImportError:
+    LGBMClassifier = None  # Graceful fallback on platforms without lightgbm
 from sklearn.linear_model import Ridge
 
 from src.config import HITTER_ATTRS, MODELS_DIR, PITCHER_ATTRS, TIER_ORDER, ALIAS_MAP
@@ -145,6 +148,11 @@ def train_change_classifier(df: pd.DataFrame) -> dict:
         pos_ratio = y.mean()
         if pos_ratio < 0.01 or pos_ratio > 0.99:
             logger.warning("Skewed target for %s (%.1f%% positive); using dummy.", label, pos_ratio * 100)
+            models[label] = {"dummy": pos_ratio}
+            continue
+
+        if LGBMClassifier is None:
+            logger.warning("lightgbm not available; skipping %s classifier.", label)
             models[label] = {"dummy": pos_ratio}
             continue
 

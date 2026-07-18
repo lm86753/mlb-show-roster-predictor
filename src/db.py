@@ -140,8 +140,8 @@ class ModelMetrics(Base):
 
 
 def get_engine(db_path: Path | None = None):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     path = db_path or DB_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
     return create_engine(f"sqlite:///{path}", echo=False)
 
 
@@ -149,6 +149,13 @@ def init_db(db_path: Path | None = None) -> sessionmaker[Session]:
     engine = get_engine(db_path)
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine)
+
+
+def safe_init_db() -> sessionmaker[Session] | None:
+    try:
+        return init_db()
+    except Exception:
+        return None
 
 
 def dumps(obj) -> str:
