@@ -19,7 +19,7 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from src.config import DB_PATH, MODELS_DIR, ALIAS_MAP
+from src.config import DB_PATH, MODELS_DIR, ALIAS_MAP, HITTER_ATTRS, PITCHER_ATTRS
 from src.db import AttributeChange, PlayerStatWindow, Prediction, init_db, dumps
 from src.formulas.ratings import project_attribute
 from src.models.registry import normalize_attr_name, attrs_for_position, stat_group
@@ -72,6 +72,45 @@ def _load_ovr_weights() -> dict:
 
 # ── Default calibration (fallback when no trained data) ──────────────────────
 _DEFAULT_CAL = {"thresh": 2.0, "scale": 0.20, "max": 4.0}
+
+# ── Attribute → OVR contribution weights ────────────────────────────────────
+# In MLB The Show, not all attributes contribute equally to Overall rating.
+# Contact and Power dominate hitter OVR; Velocity/Control/Movement dominate pitcher.
+# Weights are normalized by attribute count so weighted sum ≈ weighted average.
+_HITTER_OVR_WEIGHTS = {
+    "contact_left":          0.16,
+    "contact_right":         0.16,
+    "power_left":            0.16,
+    "power_right":           0.16,
+    "plate_vision":          0.10,
+    "plate_discipline":      0.05,
+    "batting_clutch":        0.05,
+    "speed":                 0.05,
+    "fielding_ability":      0.04,
+    "arm_strength":          0.03,
+    "arm_accuracy":          0.02,
+    "reaction_time":         0.02,
+}
+
+_PITCHER_OVR_WEIGHTS = {
+    "pitch_velocity":        0.18,
+    "pitch_control":         0.18,
+    "pitch_movement":        0.18,
+    "pitching_clutch":       0.04,
+    "stamina":               0.04,
+    "k_per_9":               0.10,
+    "k_per_9_r":             0.05,
+    "k_per_9_l":             0.05,
+    "h_per_9":               0.06,
+    "h_per_9_r":             0.04,
+    "hr_per_9":              0.04,
+    "bb_per_9":              0.04,
+}
+
+
+def _ovr_weight(attr: str, is_hitter: bool) -> float:
+    weights = _HITTER_OVR_WEIGHTS if is_hitter else _PITCHER_OVR_WEIGHTS
+    return weights.get(attr, 0.02)
 
 _ATTR_DEFAULTS = {
     "contact_left":          {"thresh": 2.0, "scale": 0.20, "max": 4.0},
@@ -355,12 +394,24 @@ def predict_attributes(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def aggregate_player_predictions(attr_df: pd.DataFrame) -> pd.DataFrame:
-    """Roll per-attribute predictions up to player-level OVR delta."""
+    """Roll per-attribute predictions up to player-level OVR delta.
+
+    Uses per-attribute OVR weights so that contact/power (hitter) and
+    velocity/control/movement (pitcher) contribute more than secondary attrs.
+    """
+    # Compute weighted delta per row
+    attr_df = attr_df.copy()
+    attr_df["is_hitter"] = attr_df["is_hitter"].astype(bool)
+    attr_df["ovr_weight"] = attr_df.apply(
+        lambda r: _ovr_weight(r["attribute_name"], r["is_hitter"]), axis=1
+    )
+    attr_df["weighted_delta"] = attr_df["predicted_delta"] * attr_df["ovr_weight"]
+
     grouped = (
-        attr_df.groupby(["card_uuid", "player_name", "mlb_player_id", "current_ovr", "current_rarity"])
+        attr_df.groupby(["card_uuid", "player_name", "mlb_player_id", "current_ovr", "current_rarity", "is_hitter"])
         .agg(
             n_attrs=("predicted_delta", "count"),
-            delta_sum=("predicted_delta", "sum"),
+            weighted_sum=("weighted_delta", "sum"),
             n_up=("predicted_delta", lambda s: (s > 0.1).sum()),
             n_down=("predicted_delta", lambda s: (s < -0.1).sum()),
             change_prob_mean=("change_prob", "mean"),
@@ -370,9 +421,8 @@ def aggregate_player_predictions(attr_df: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
 
-    mean_delta = grouped["delta_sum"] / grouped["n_attrs"].clip(lower=1)
     ovr_mult = 2.0 - 0.5 * (grouped["current_ovr"] / 99.0)
-    grouped["predicted_ovr_delta"] = (mean_delta * ovr_mult).clip(-12.0, 12.0)
+    grouped["predicted_ovr_delta"] = (grouped["weighted_sum"] * ovr_mult).clip(-12.0, 12.0)
 
     # Convert predicted OVR delta to proper directional probabilities
     # Using a logistic function: delta=0 → p=0.50, delta=+2 → p≈0.73, delta=+3 → p≈0.82, delta=+5 → p≈0.92
@@ -392,8 +442,9 @@ def aggregate_player_predictions(attr_df: pd.DataFrame) -> pd.DataFrame:
         return 0.0
 
     grouped["tier_jump_probability"] = grouped.apply(_tier_jump, axis=1)
+    pct_up = grouped["n_up"] / grouped["n_attrs"].clip(lower=1)
     grouped["direction_consensus"] = (2 * pct_up - 1).clip(-1, 1)
-    grouped["avg_gap"] = grouped["delta_sum"] / grouped["n_attrs"].clip(lower=1)
+    grouped["avg_gap"] = grouped["weighted_sum"] / grouped["n_attrs"].clip(lower=1)
 
     grouped["investment_score"] = (
         grouped["upgrade_probability"] * 0.40
