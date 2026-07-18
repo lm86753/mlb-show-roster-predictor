@@ -71,33 +71,33 @@ def _load_ovr_weights() -> dict:
 
 
 # ── Default calibration (fallback when no trained data) ──────────────────────
-_DEFAULT_CAL = {"thresh": 2.0, "scale": 0.30, "max": 8.0}
+_DEFAULT_CAL = {"thresh": 2.0, "scale": 0.20, "max": 4.0}
 
 _ATTR_DEFAULTS = {
-    "contact_left":          {"thresh": 1.5, "scale": 0.35, "max": 8.0},
-    "contact_right":         {"thresh": 1.5, "scale": 0.35, "max": 8.0},
-    "power_left":            {"thresh": 1.5, "scale": 0.33, "max": 8.0},
-    "power_right":           {"thresh": 1.5, "scale": 0.33, "max": 8.0},
-    "plate_vision":          {"thresh": 1.0, "scale": 0.40, "max": 10.0},
-    "plate_discipline":      {"thresh": 1.5, "scale": 0.30, "max": 8.0},
-    "batting_clutch":        {"thresh": 1.5, "scale": 0.35, "max": 12.0},
-    "speed":                 {"thresh": 1.0, "scale": 0.40, "max": 12.0},
-    "fielding_ability":      {"thresh": 2.0, "scale": 0.28, "max": 8.0},
-    "arm_strength":          {"thresh": 2.0, "scale": 0.28, "max": 8.0},
-    "arm_accuracy":          {"thresh": 2.0, "scale": 0.28, "max": 8.0},
-    "reaction_time":         {"thresh": 2.0, "scale": 0.28, "max": 8.0},
-    "pitch_velocity":        {"thresh": 1.0, "scale": 0.40, "max": 10.0},
-    "pitch_control":         {"thresh": 1.5, "scale": 0.35, "max": 10.0},
-    "pitch_movement":        {"thresh": 1.5, "scale": 0.33, "max": 10.0},
-    "pitching_clutch":       {"thresh": 1.0, "scale": 0.40, "max": 14.0},
-    "stamina":               {"thresh": 3.0, "scale": 0.20, "max": 6.0},
-    "k_per_9":               {"thresh": 1.0, "scale": 0.35, "max": 10.0},
-    "hr_per_9":              {"thresh": 1.0, "scale": 0.35, "max": 10.0},
-    "k_per_9_r":             {"thresh": 1.0, "scale": 0.35, "max": 10.0},
-    "k_per_9_l":             {"thresh": 1.0, "scale": 0.35, "max": 10.0},
-    "h_per_9_r":             {"thresh": 1.0, "scale": 0.40, "max": 12.0},
-    "h_per_9":               {"thresh": 1.0, "scale": 0.40, "max": 12.0},
-    "bb_per_9":              {"thresh": 1.0, "scale": 0.35, "max": 10.0},
+    "contact_left":          {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "contact_right":         {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "power_left":            {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "power_right":           {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "plate_vision":          {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "plate_discipline":      {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "batting_clutch":        {"thresh": 2.0, "scale": 0.20, "max": 5.0},
+    "speed":                 {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "fielding_ability":      {"thresh": 3.0, "scale": 0.15, "max": 3.0},
+    "arm_strength":          {"thresh": 3.0, "scale": 0.15, "max": 3.0},
+    "arm_accuracy":          {"thresh": 3.0, "scale": 0.15, "max": 3.0},
+    "reaction_time":         {"thresh": 3.0, "scale": 0.15, "max": 3.0},
+    "pitch_velocity":        {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "pitch_control":         {"thresh": 2.0, "scale": 0.22, "max": 5.0},
+    "pitch_movement":        {"thresh": 2.0, "scale": 0.22, "max": 5.0},
+    "pitching_clutch":       {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "stamina":               {"thresh": 3.0, "scale": 0.15, "max": 3.0},
+    "k_per_9":               {"thresh": 1.5, "scale": 0.22, "max": 5.0},
+    "hr_per_9":              {"thresh": 1.5, "scale": 0.22, "max": 5.0},
+    "k_per_9_r":             {"thresh": 1.5, "scale": 0.22, "max": 5.0},
+    "k_per_9_l":             {"thresh": 1.5, "scale": 0.22, "max": 5.0},
+    "h_per_9_r":             {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "h_per_9":               {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "bb_per_9":              {"thresh": 1.5, "scale": 0.22, "max": 5.0},
 }
 
 
@@ -249,9 +249,9 @@ def predict_attr_delta(
     elif has_data and abs(gap) >= cal["thresh"]:
         predicted = gap * cal["scale"]
         predicted = max(-cal["max"], min(cal["max"], predicted))
-    elif not has_data and abs(gap) >= 2.0:
-        predicted = gap * 0.12
-        predicted = max(-5.0, min(5.0, predicted))
+    elif not has_data and abs(gap) >= 3.0:
+        predicted = gap * 0.08
+        predicted = max(-2.0, min(2.0, predicted))
     else:
         predicted = 0.0
 
