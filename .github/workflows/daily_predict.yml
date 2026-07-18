@@ -1,0 +1,32 @@
+name: Daily Predictions
+
+on:
+  schedule:
+    - cron: "0 11 * * *"  # 6 AM ET (11 UTC)
+  workflow_dispatch:
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Backfill roster updates (incremental)
+        run: python scripts/backfill_updates.py --years 26
+
+      - name: Train models if missing
+        run: |
+          if [ ! -f data/models/layer1_attributes.joblib ]; then
+            python scripts/train.py --skip-stats
+          fi
+
+      - name: Run daily predictions (T-7, T-3, T-1)
+        run: python scripts/daily_predict.py --horizons 7 3 1
