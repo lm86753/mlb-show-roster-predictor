@@ -67,6 +67,26 @@ def get_dashboard(horizon_days: int = Query(1, ge=1, le=30)):
     Session = safe_init_db()
     if Session is None:
         return {"count": 0, "predictions": [], "update_status": {"latest": None, "days_since": None, "days_until": None}}
+
+    # Static fallback: if no predictions in DB, try loading pre-computed JSON
+    # (generated at build time so the site works immediately on Vercel)
+    _STATIC_PREDICTIONS_PATH = PROJECT_ROOT / "data" / "static_predictions.json"
+    _HAS_CHECKED_STATIC = [False]
+    _STATIC_CACHE = [None]
+
+    if _STATIC_PREDICTIONS_PATH.exists() and not _HAS_CHECKED_STATIC[0]:
+        _HAS_CHECKED_STATIC[0] = True
+        try:
+            _STATIC_CACHE[0] = json.loads(_STATIC_PREDICTIONS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    with Session() as session:
+        pred_count = session.query(Prediction).filter(Prediction.horizon_days == horizon_days).count()
+
+    if pred_count == 0 and _STATIC_CACHE[0] is not None:
+        return _STATIC_CACHE[0]
+
     with Session() as session:
         predictions = (
             session.query(Prediction)

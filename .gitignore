@@ -16,3 +16,4 @@ data/*.db
 nul
 streamlit*.log
 .vscode/
+.vercel

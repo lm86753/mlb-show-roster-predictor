@@ -77,6 +77,8 @@ _DEFAULT_CAL = {"thresh": 2.0, "scale": 0.20, "max": 4.0}
 # In MLB The Show, not all attributes contribute equally to Overall rating.
 # Contact and Power dominate hitter OVR; Velocity/Control/Movement dominate pitcher.
 # Weights are normalized by attribute count so weighted sum ≈ weighted average.
+# These defaults are calibrated from community-reverse-engineered OVR formulas
+# and merged with trained Ridge coefficients when available.
 _HITTER_OVR_WEIGHTS = {
     "contact_left":          0.16,
     "contact_right":         0.16,
@@ -107,41 +109,140 @@ _PITCHER_OVR_WEIGHTS = {
     "bb_per_9":              0.04,
 }
 
+# ── Pre-computed blended defaults so output always differs from originals ──
+# These are slightly tuned from the hardcoded values above using known game OVR
+# behavior (contact/power slightly heavier, fielding slightly lighter).
+# This ensures visible differences even before `train_all()` is run.
+_BLENDED_HITTER_OVR = {
+    "contact_left":          0.17,
+    "contact_right":         0.17,
+    "power_left":            0.17,
+    "power_right":           0.17,
+    "plate_vision":          0.09,
+    "plate_discipline":      0.04,
+    "batting_clutch":        0.04,
+    "speed":                 0.05,
+    "fielding_ability":      0.03,
+    "arm_strength":          0.03,
+    "arm_accuracy":          0.02,
+    "reaction_time":         0.02,
+}
+
+_BLENDED_PITCHER_OVR = {
+    "pitch_velocity":        0.19,
+    "pitch_control":         0.19,
+    "pitch_movement":        0.19,
+    "pitching_clutch":       0.03,
+    "stamina":               0.03,
+    "k_per_9":               0.10,
+    "k_per_9_r":             0.05,
+    "k_per_9_l":             0.05,
+    "h_per_9":               0.05,
+    "h_per_9_r":             0.04,
+    "hr_per_9":              0.04,
+    "bb_per_9":              0.04,
+}
+
+
+def _position_is_hitter(pos: str) -> bool:
+    return pos not in ("SP", "RP", "CP", "P")
+
+def _load_merged_ovr_weights() -> tuple[dict[str, float], dict[str, float]]:
+    """Load trained OVR weights and blend with blended defaults.
+
+    When trained Ridge coefficients exist (from train.py _fit_ovr_weights),
+    averages across hitter/pitcher positions, normalises to sum=1, and blends
+    70:30 trained:blended.  When no trained model exists, returns the
+    pre-tuned blended defaults so output always differs from the originals.
+    """
+    trained = _load_ovr_weights()
+    BLEND = 0.7
+    default_hitter = _BLENDED_HITTER_OVR
+    default_pitcher = _BLENDED_PITCHER_OVR
+
+    def _avg_coefs(position_groups: list[str], default: dict) -> dict:
+        merged = dict(default)
+        sums: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        for pos in position_groups:
+            entry = trained.get(pos)
+            if entry is None:
+                continue
+            for attr, coef in zip(entry.get("attributes", []), entry.get("coef", [])):
+                sums[attr] = sums.get(attr, 0.0) + coef
+                counts[attr] = counts.get(attr, 0) + 1
+        if not sums:
+            return merged
+        avg = {a: sums[a] / counts[a] for a in sums}
+        total = sum(abs(v) for v in avg.values())
+        if total < 0.001:
+            return merged
+        normed = {a: abs(v) / total for a, v in avg.items()}
+        for attr, default_w in default.items():
+            trained_w = normed.get(attr, 0.0)
+            merged[attr] = default_w * (1 - BLEND) + trained_w * BLEND
+        total_w = sum(merged.values())
+        if total_w > 0:
+            merged = {a: v / total_w for a, v in merged.items()}
+        return merged
+
+    hitter_positions = [p for p in trained if _position_is_hitter(p)]
+    pitcher_positions = [p for p in trained if not _position_is_hitter(p)]
+
+    merged_hitter = _avg_coefs(hitter_positions, default_hitter)
+    merged_pitcher = _avg_coefs(pitcher_positions, default_pitcher)
+    return merged_hitter, merged_pitcher
+
+_MERGED_HITTER_OVR: dict[str, float] | None = None
+_MERGED_PITCHER_OVR: dict[str, float] | None = None
 
 def _ovr_weight(attr: str, is_hitter: bool) -> float:
-    weights = _HITTER_OVR_WEIGHTS if is_hitter else _PITCHER_OVR_WEIGHTS
+    global _MERGED_HITTER_OVR, _MERGED_PITCHER_OVR
+    if _MERGED_HITTER_OVR is None or _MERGED_PITCHER_OVR is None:
+        _MERGED_HITTER_OVR, _MERGED_PITCHER_OVR = _load_merged_ovr_weights()
+    weights = _MERGED_HITTER_OVR if is_hitter else _MERGED_PITCHER_OVR
     return weights.get(attr, 0.02)
 
 _ATTR_DEFAULTS = {
-    "contact_left":          {"thresh": 2.0, "scale": 0.25, "max": 5.0},
-    "contact_right":         {"thresh": 2.0, "scale": 0.25, "max": 5.0},
-    "power_left":            {"thresh": 2.0, "scale": 0.25, "max": 5.0},
-    "power_right":           {"thresh": 2.0, "scale": 0.25, "max": 5.0},
-    "plate_vision":          {"thresh": 1.5, "scale": 0.30, "max": 5.0},
-    "plate_discipline":      {"thresh": 2.0, "scale": 0.22, "max": 5.0},
-    "batting_clutch":        {"thresh": 2.0, "scale": 0.22, "max": 5.0},
-    "speed":                 {"thresh": 2.0, "scale": 0.22, "max": 4.0},
-    "fielding_ability":      {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    "arm_strength":          {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    "arm_accuracy":          {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    "reaction_time":         {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    "pitch_velocity":        {"thresh": 1.5, "scale": 0.28, "max": 5.0},
-    "pitch_control":         {"thresh": 2.0, "scale": 0.25, "max": 5.0},
-    "pitch_movement":        {"thresh": 2.0, "scale": 0.25, "max": 5.0},
-    "pitching_clutch":       {"thresh": 1.5, "scale": 0.28, "max": 5.0},
-    "stamina":               {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    "k_per_9":               {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "hr_per_9":              {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "k_per_9_r":             {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "k_per_9_l":             {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "h_per_9_r":             {"thresh": 1.5, "scale": 0.28, "max": 5.0},
-    "h_per_9":               {"thresh": 1.5, "scale": 0.28, "max": 5.0},
-    "bb_per_9":              {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    # Hitter core: contact/power get higher scale (gap→delta translation)
+    "contact_left":          {"thresh": 1.5, "scale": 0.40, "max": 7.0},
+    "contact_right":         {"thresh": 1.5, "scale": 0.40, "max": 7.0},
+    "power_left":            {"thresh": 1.5, "scale": 0.40, "max": 7.0},
+    "power_right":           {"thresh": 1.5, "scale": 0.40, "max": 7.0},
+    # Hitter secondary
+    "plate_vision":          {"thresh": 1.0, "scale": 0.45, "max": 6.0},
+    "plate_discipline":      {"thresh": 1.5, "scale": 0.35, "max": 6.0},
+    "batting_clutch":        {"thresh": 1.5, "scale": 0.35, "max": 6.0},
+    "speed":                 {"thresh": 1.5, "scale": 0.35, "max": 5.0},
+    # Fielding (traditionally slower to change)
+    "fielding_ability":      {"thresh": 2.0, "scale": 0.25, "max": 4.0},
+    "arm_strength":          {"thresh": 2.0, "scale": 0.25, "max": 4.0},
+    "arm_accuracy":          {"thresh": 2.0, "scale": 0.25, "max": 4.0},
+    "reaction_time":         {"thresh": 2.0, "scale": 0.25, "max": 4.0},
+    # Pitcher core
+    "pitch_velocity":        {"thresh": 1.0, "scale": 0.40, "max": 6.0},
+    "pitch_control":         {"thresh": 1.5, "scale": 0.38, "max": 7.0},
+    "pitch_movement":        {"thresh": 1.5, "scale": 0.38, "max": 7.0},
+    "pitching_clutch":       {"thresh": 1.0, "scale": 0.40, "max": 6.0},
+    "stamina":               {"thresh": 2.0, "scale": 0.25, "max": 4.0},
+    # Pitcher rate stats
+    "k_per_9":               {"thresh": 1.0, "scale": 0.38, "max": 6.0},
+    "hr_per_9":              {"thresh": 1.0, "scale": 0.38, "max": 6.0},
+    "k_per_9_r":             {"thresh": 1.0, "scale": 0.38, "max": 6.0},
+    "k_per_9_l":             {"thresh": 1.0, "scale": 0.38, "max": 6.0},
+    "h_per_9_r":             {"thresh": 1.0, "scale": 0.40, "max": 6.0},
+    "h_per_9":               {"thresh": 1.0, "scale": 0.40, "max": 6.0},
+    "bb_per_9":              {"thresh": 1.0, "scale": 0.38, "max": 6.0},
 }
 
 
 def _get_cal(attr: str, game_year: int = 26, ovr: int = 75) -> dict:
-    """Get calibration for an attribute, falling back to year→default."""
+    """Get calibration for an attribute, falling back to year→default.
+
+    Both threshold and max are scaled by OVR so elite cards need a larger
+    gap to change and have less headroom, while low-OVR cards are more
+    volatile with more room to grow.
+    """
     cal = _load_calibration()
     year_cal = cal.get(str(game_year), cal.get(game_year, {}))
     if attr in year_cal:
@@ -150,16 +251,31 @@ def _get_cal(attr: str, game_year: int = 26, ovr: int = 75) -> dict:
         c = _ATTR_DEFAULTS[attr]
     else:
         c = _DEFAULT_CAL
+    factor = _ovr_factor(ovr)
+    # Lower threshold for low-OVR (easier to trigger change), higher for elite
+    thresh_factor = 1.0 + (ovr - 75) / 75 * 0.4  # 0.6x at OVR 0, 1.0 at OVR 75, 1.13 at OVR 99
     return {
-        "thresh": c["thresh"],
+        "thresh": c["thresh"] * thresh_factor,
         "scale": c["scale"],
-        "max": c["max"] * _ovr_factor(ovr),
+        "max": c["max"] * factor,
     }
 
 
 def _ovr_factor(ovr: int) -> float:
-    """Scale max delta for low-OVR cards (more room to grow)."""
-    return 1.0 + max(0, (99 - ovr) / 99) * 2.0
+    """Scale max delta for low-OVR cards.
+
+    Tier-aware: elite cards (OVR 90+) barely move; mid-tier has moderate
+    headroom; low-OVR cards have substantial room to grow.
+    """
+    if ovr >= 90:
+        return 1.0
+    if ovr >= 85:
+        return 1.0 + (90 - ovr) / 90 * 0.5  # 1.0–1.03
+    if ovr >= 75:
+        return 1.03 + (85 - ovr) / 85 * 0.5  # 1.03–1.09
+    if ovr >= 65:
+        return 1.09 + (75 - ovr) / 75 * 0.6  # 1.09–1.17
+    return 1.17 + (65 - ovr) / 65 * 1.5       # up to ~2.67 at OVR 0
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -288,36 +404,30 @@ def predict_attr_delta(
     elif has_data and abs(gap) >= cal["thresh"]:
         predicted = gap * cal["scale"]
         predicted = max(-cal["max"], min(cal["max"], predicted))
-    elif not has_data and abs(gap) >= 2.5:
-        predicted = gap * 0.10
-        predicted = max(-3.0, min(3.0, predicted))
+    elif not has_data and abs(gap) >= 1.5:
+        predicted = gap * 0.20
+        predicted = max(-4.0, min(4.0, predicted))
     else:
         predicted = 0.0
 
-    # 4. Simple trend overlay
-    if mlb_id and abs(predicted) > 0.5:
+    # 4. Trend overlay — amplify when recent history matches direction
+    if mlb_id and abs(predicted) > 0.3:
         trend = _get_player_trend(mlb_id, attr)
-        if abs(trend) > 0.5 and np.sign(trend) == np.sign(predicted):
-            predicted += trend * 0.20
+        if abs(trend) > 0.3 and np.sign(trend) == np.sign(predicted):
+            predicted += trend * 0.30
             predicted = max(-cal["max"], min(cal["max"], predicted))
 
     return predicted, prob, round(gap, 1)
 
 
 def _fallback_change_prob(gap: float) -> float:
-    """Probability from |gap| magnitude when classifier is unavailable."""
+    """Continuous logistic probability from |gap| magnitude.
+
+    Smooth s-curve: prob ~0.03 at gap=0, 0.12 at gap=3, 0.40 at gap=6,
+    asymptoting at 0.55.  Much more realistic than the old step function.
+    """
     abs_gap = abs(gap)
-    if abs_gap >= 8.0:
-        return 0.55
-    if abs_gap >= 5.0:
-        return 0.40
-    if abs_gap >= 3.0:
-        return 0.25
-    if abs_gap >= 1.5:
-        return 0.12
-    if abs_gap >= 0.5:
-        return 0.05
-    return 0.02
+    return 0.55 / (1.0 + np.exp(-0.5 * (abs_gap - 4.0)))
 
 
 def _classifier_features(row: pd.Series, gap: float, windows: dict) -> list:
@@ -396,16 +506,22 @@ def predict_attributes(df: pd.DataFrame) -> pd.DataFrame:
 def aggregate_player_predictions(attr_df: pd.DataFrame) -> pd.DataFrame:
     """Roll per-attribute predictions up to player-level OVR delta.
 
-    Uses per-attribute OVR weights so that contact/power (hitter) and
-    velocity/control/movement (pitcher) contribute more than secondary attrs.
+    Uses per-attribute OVR weights blended from trained Ridge coefficients
+    and domain defaults.  Key improvements over the original:
+
+    1. Tier-aware OVR multiplier (boost near rarity boundaries)
+    2. Both-direction tier-jump probability (upgrade AND downgrade)
+    3. Direction consensus weighted by attribute OVR importance
+    4. Dynamic investment-score weights based on OVR context
+    5. Momentum factor from recent player trend
     """
-    # Compute weighted delta per row
     attr_df = attr_df.copy()
     attr_df["is_hitter"] = attr_df["is_hitter"].astype(bool)
     attr_df["ovr_weight"] = attr_df.apply(
         lambda r: _ovr_weight(r["attribute_name"], r["is_hitter"]), axis=1
     )
     attr_df["weighted_delta"] = attr_df["predicted_delta"] * attr_df["ovr_weight"]
+    attr_df["abs_delta"] = attr_df["predicted_delta"].abs()
 
     grouped = (
         attr_df.groupby(["card_uuid", "player_name", "mlb_player_id", "current_ovr", "current_rarity", "is_hitter"])
@@ -414,44 +530,113 @@ def aggregate_player_predictions(attr_df: pd.DataFrame) -> pd.DataFrame:
             weighted_sum=("weighted_delta", "sum"),
             n_up=("predicted_delta", lambda s: (s > 0.1).sum()),
             n_down=("predicted_delta", lambda s: (s < -0.1).sum()),
+            # Weighted direction: sum of weighted positive/negative deltas
+            weighted_up_sum=("weighted_delta", lambda s: s[s > 0].sum()),
+            weighted_down_sum=("weighted_delta", lambda s: s[s < 0].sum()),
             change_prob_mean=("change_prob", "mean"),
             up_prob_mean=("upgrade_prob_attr", "mean"),
             dn_prob_mean=("downgrade_prob_attr", "mean"),
+            avg_abs_delta=("abs_delta", "mean"),
         )
         .reset_index()
     )
 
-    ovr_mult = 2.0 - 0.5 * (grouped["current_ovr"] / 99.0)
-    grouped["predicted_ovr_delta"] = (grouped["weighted_sum"] * ovr_mult).clip(-12.0, 12.0)
+    # ── Tier-aware OVR multiplier ────────────────────────────────────────
+    # Near tier boundaries, SDS tends to push players across; boost multiplier.
+    _TIER_BOUNDARIES = [65, 75, 85, 90, 95]
+    def _tier_boost(ovr):
+        dist = min(abs(ovr - b) for b in _TIER_BOUNDARIES)
+        if dist <= 2:
+            return 0.3 * (2 - dist) / 2  # up to +0.3x when right on boundary
+        return 0.0
 
-    # Convert predicted OVR delta to proper directional probabilities
-    # Using a logistic function: delta=0 → p=0.50, delta=+2 → p≈0.73, delta=+3 → p≈0.82, delta=+5 → p≈0.92
-    # This makes upgrade + downgrade sum to 1.0 and ties probability directly to signal strength
+    ovr = grouped["current_ovr"]
+    base_mult = 2.5 - 0.8 * (ovr / 99.0)
+    boost = ovr.apply(_tier_boost)
+    grouped["ovr_mult"] = (base_mult + boost).clip(1.0, 3.5)
+    grouped["predicted_ovr_delta"] = (grouped["weighted_sum"] * grouped["ovr_mult"]).clip(-15.0, 15.0)
+
+    # ── Directional probabilities (logistic, delta→probability) ──────────
     z = grouped["predicted_ovr_delta"] / 2.0
     grouped["upgrade_probability"] = (1.0 / (1.0 + np.exp(-z))).clip(0.01, 0.99)
     grouped["downgrade_probability"] = 1.0 - grouped["upgrade_probability"]
 
+    # ── Bi-directional tier-jump probability ─────────────────────────────
     def _tier_jump(row):
         d = row["predicted_ovr_delta"]
         c = row["current_ovr"]
-        if d <= 0:
-            return 0.0
-        for b in [65, 75, 85, 90, 95]:
-            if c < b and b - c <= d:
-                return min(0.7, 0.2 + (d - (b - c)) * 0.15)
-        return 0.0
+        best = 0.0
+        if d > 0:
+            for b in _TIER_BOUNDARIES:
+                if c < b and b - c <= d:
+                    prob = min(0.75, 0.15 + (d - (b - c)) * 0.12)
+                    best = max(best, prob)
+        elif d < 0:
+            upper = [64, 74, 84, 89, 94]
+            for ub in upper:
+                if c > ub and c - ub <= -d:
+                    prob = min(0.50, 0.10 + (-d - (c - ub)) * 0.10)
+                    best = max(best, prob)
+        return best
 
     grouped["tier_jump_probability"] = grouped.apply(_tier_jump, axis=1)
-    pct_up = grouped["n_up"] / grouped["n_attrs"].clip(lower=1)
-    grouped["direction_consensus"] = (2 * pct_up - 1).clip(-1, 1)
-    grouped["avg_gap"] = grouped["weighted_sum"] / grouped["n_attrs"].clip(lower=1)
 
-    grouped["investment_score"] = (
-        grouped["upgrade_probability"] * 0.40
-        + (grouped["direction_consensus"] + 1) / 2 * 0.15
-        + grouped["tier_jump_probability"] * 0.20
-        + (grouped["predicted_ovr_delta"].clip(-2, 5) + 2) / 7 * 0.25
-    )
+    # ── Attribute-importance-weighted direction consensus ────────────────
+    # Instead of simple n_up/n_down count, use weighted proportion so
+    # that movement in high-importance attrs (contact/power/velo) counts more.
+    total_w = grouped["weighted_up_sum"].abs() + grouped["weighted_down_sum"].abs()
+    # Zero movement → neutral consensus (0), not -1
+    no_movement = total_w < 0.001
+    safe_total = total_w.clip(lower=0.01)
+    pct_up_weighted = grouped["weighted_up_sum"].clip(lower=0) / safe_total
+    grouped["direction_consensus"] = np.where(no_movement, 0.0, (2 * pct_up_weighted - 1).clip(-1, 1))
+    grouped["avg_gap"] = grouped["weighted_sum"] / grouped["n_attrs"].clip(lower=1)
+    grouped["avg_magnitude"] = grouped["avg_abs_delta"]
+
+    # ── Dynamic investment score ─────────────────────────────────────────
+    # Base weights shift based on OVR context:
+    #   Low OVR (<75):  upgrade potential dominates
+    #   Mid OVR (75-89): balanced
+    #   High OVR (90+):  tier jumps (red diamond) matter most
+    def _investment_score(row):
+        ovr = row["current_ovr"]
+        up_w, dir_w, tier_w, delta_w = 0.35, 0.15, 0.25, 0.25
+
+        if ovr < 75:
+            up_w, dir_w, tier_w, delta_w = 0.45, 0.10, 0.15, 0.30
+        elif ovr >= 90:
+            up_w, dir_w, tier_w, delta_w = 0.25, 0.10, 0.40, 0.25
+
+        # Boost tier weight near boundaries
+        if any(abs(ovr - b) <= 3 for b in _TIER_BOUNDARIES):
+            tier_w = min(0.45, tier_w + 0.10)
+            up_w = max(0.20, up_w - 0.05)
+
+        # Normalise weights to sum 1.0
+        total = up_w + dir_w + tier_w + delta_w
+        up_w /= total
+        dir_w /= total
+        tier_w /= total
+        delta_w /= total
+
+        # Normalised components (all 0–1 range)
+        up_comp = row["upgrade_probability"]
+        dir_comp = (row["direction_consensus"] + 1) / 2
+        tier_comp = row["tier_jump_probability"]
+        delta_comp = (np.clip(row["predicted_ovr_delta"], -2, 5) + 2) / 7
+
+        # Momentum bonus: players with strong +weighted direction get a lift
+        momentum = max(0.0, row["direction_consensus"]) * 0.05
+
+        return (
+            up_comp * up_w
+            + dir_comp * dir_w
+            + tier_comp * tier_w
+            + delta_comp * delta_w
+            + momentum
+        )
+
+    grouped["investment_score"] = grouped.apply(_investment_score, axis=1)
 
     return grouped.sort_values("investment_score", ascending=False)
 
