@@ -1,61 +1,99 @@
 """
-Unified prediction pipeline for MLB The Show roster updates.
+Three-signal ensemble prediction pipeline.
 
 Architecture:
-  - Formula projection (primary signal) → gap per attribute
-  - Change probability from LightGBM classifier (hitter/pitcher)
-  - Direction from sign(gap) if |gap| > per-attr threshold
-  - Magnitude from calibrated gap: clamp(gap * scale, -max, +max)
-  - OVR delta = mean(attr_deltas) * OVR_multiplier
+  Signal 1: Multi-window gap projection → calibrated delta (as-if-update-today)
+  Signal 2: Gradient boosted regression → direct delta prediction
+  Signal 3: Historical analog matching → k-NN weighted outcome
+
+  Ensemble: Learned weighted blend → final delta
+  Confidence: Bucketed error percentiles → interval
+  Market Sim: Expected stub profit from calibrated probabilities
+
+All signals are computed per-attribute, then aggregated to player-level OVR.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from collections import defaultdict
+from functools import lru_cache
 
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.metrics.pairwise import cosine_similarity
 
-from src.config import DB_PATH, MODELS_DIR, ALIAS_MAP, HITTER_ATTRS, PITCHER_ATTRS
+from src.config import DB_PATH, MODELS_DIR, HITTER_ATTRS, PITCHER_ATTRS
 from src.db import AttributeChange, PlayerStatWindow, Prediction, init_db, dumps
-from src.formulas.ratings import project_attribute
+from src.formulas.ratings import project_attribute, LEAGUE_AVG
 from src.models.registry import normalize_attr_name, attrs_for_position, stat_group
-from src.features.engineering import sample_size_ok, tier_distance, ovr_distance_to_tier_boundary
+from src.features.engineering import (
+    compute_window_projections, compute_window_gaps,
+    sample_size_ok, ovr_distance_to_tier_boundary,
+    WINDOW_PRIORITY, WINDOW_WEIGHTS,
+    REGRESSION_FEATURES,
+)
 
-# ── Model/calibration loaders (lazy, cached) ─────────────────────────────────
+logger = logging.getLogger(__name__)
+
+# ── Static model cache ─────────────────────────────────────────────────────
 _CALIBRATION = None
-_CLASSIFIERS = None
+_REGRESSION = None
+_ANALOG_INDEX = None
+_ENSEMBLE_WEIGHTS = None
+_CONFIDENCE_BUCKETS = None
 _OVR_WEIGHTS = None
+_MARKET_CAL = None
 
+
+# ── Model loaders (lazy) ───────────────────────────────────────────────────
 
 def _load_calibration() -> dict:
     global _CALIBRATION
     if _CALIBRATION is not None:
         return _CALIBRATION
     path = MODELS_DIR / "calibration.json"
-    if not path.exists():
-        _CALIBRATION = {}
-    else:
-        _CALIBRATION = json.loads(path.read_text(encoding="utf-8"))
+    _CALIBRATION = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     return _CALIBRATION
 
 
-def _load_classifiers() -> dict:
-    global _CLASSIFIERS
-    if _CLASSIFIERS is not None:
-        return _CLASSIFIERS
-    path = MODELS_DIR / "change_classifiers.joblib"
-    if not path.exists():
-        _CLASSIFIERS = {}
-    else:
-        try:
-            _CLASSIFIERS = joblib.load(path)
-        except Exception:
-            _CLASSIFIERS = {}
-    return _CLASSIFIERS
+def _load_regression() -> dict:
+    global _REGRESSION
+    if _REGRESSION is not None:
+        return _REGRESSION
+    path = MODELS_DIR / "delta_regression.joblib"
+    _REGRESSION = joblib.load(path) if path.exists() else {}
+    return _REGRESSION
+
+
+def _load_analog_index() -> dict:
+    global _ANALOG_INDEX
+    if _ANALOG_INDEX is not None:
+        return _ANALOG_INDEX
+    path = MODELS_DIR / "analog_index.joblib"
+    _ANALOG_INDEX = joblib.load(path) if path.exists() else {}
+    return _ANALOG_INDEX
+
+
+def _load_ensemble_weights() -> dict:
+    global _ENSEMBLE_WEIGHTS
+    if _ENSEMBLE_WEIGHTS is not None:
+        return _ENSEMBLE_WEIGHTS
+    path = MODELS_DIR / "ensemble_weights.json"
+    _ENSEMBLE_WEIGHTS = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    return _ENSEMBLE_WEIGHTS
+
+
+def _load_confidence_buckets() -> list:
+    global _CONFIDENCE_BUCKETS
+    if _CONFIDENCE_BUCKETS is not None:
+        return _CONFIDENCE_BUCKETS
+    path = MODELS_DIR / "confidence_buckets.json"
+    _CONFIDENCE_BUCKETS = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+    return _CONFIDENCE_BUCKETS
 
 
 def _load_ovr_weights() -> dict:
@@ -63,102 +101,46 @@ def _load_ovr_weights() -> dict:
     if _OVR_WEIGHTS is not None:
         return _OVR_WEIGHTS
     path = MODELS_DIR / "ovr_weights.joblib"
-    if not path.exists():
-        _OVR_WEIGHTS = {}
-    else:
-        _OVR_WEIGHTS = joblib.load(path)
+    _OVR_WEIGHTS = joblib.load(path) if path.exists() else {}
     return _OVR_WEIGHTS
 
 
-# ── Default calibration (fallback when no trained data) ──────────────────────
-_DEFAULT_CAL = {"thresh": 2.0, "scale": 0.20, "max": 4.0}
+def _load_market_cal() -> dict:
+    global _MARKET_CAL
+    if _MARKET_CAL is not None:
+        return _MARKET_CAL
+    path = MODELS_DIR / "market_calibration.json"
+    _MARKET_CAL = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    return _MARKET_CAL
 
-# ── Attribute → OVR contribution weights ────────────────────────────────────
-# In MLB The Show, not all attributes contribute equally to Overall rating.
-# Contact and Power dominate hitter OVR; Velocity/Control/Movement dominate pitcher.
-# Weights are normalized by attribute count so weighted sum ≈ weighted average.
-# These defaults are calibrated from community-reverse-engineered OVR formulas
-# and merged with trained Ridge coefficients when available.
-_HITTER_OVR_WEIGHTS = {
-    "contact_left":          0.16,
-    "contact_right":         0.16,
-    "power_left":            0.16,
-    "power_right":           0.16,
-    "plate_vision":          0.10,
-    "plate_discipline":      0.05,
-    "batting_clutch":        0.05,
-    "speed":                 0.05,
-    "fielding_ability":      0.04,
-    "arm_strength":          0.03,
-    "arm_accuracy":          0.02,
-    "reaction_time":         0.02,
+
+# ── Attribute → OVR contribution weights ──────────────────────────────────
+# Same defaults as before, loaded from trained when available
+
+_DEFAULT_HITTER_OVR = {
+    "contact_left": 0.16, "contact_right": 0.16,
+    "power_left": 0.16, "power_right": 0.16,
+    "plate_vision": 0.10, "plate_discipline": 0.05,
+    "batting_clutch": 0.05, "speed": 0.05,
+    "fielding_ability": 0.04, "arm_strength": 0.03,
+    "arm_accuracy": 0.02, "reaction_time": 0.02,
 }
 
-_PITCHER_OVR_WEIGHTS = {
-    "pitch_velocity":        0.18,
-    "pitch_control":         0.18,
-    "pitch_movement":        0.18,
-    "pitching_clutch":       0.04,
-    "stamina":               0.04,
-    "k_per_9":               0.10,
-    "k_per_9_r":             0.05,
-    "k_per_9_l":             0.05,
-    "h_per_9":               0.06,
-    "h_per_9_r":             0.04,
-    "hr_per_9":              0.04,
-    "bb_per_9":              0.04,
-}
-
-# ── Pre-computed blended defaults so output always differs from originals ──
-# These are slightly tuned from the hardcoded values above using known game OVR
-# behavior (contact/power slightly heavier, fielding slightly lighter).
-# This ensures visible differences even before `train_all()` is run.
-_BLENDED_HITTER_OVR = {
-    "contact_left":          0.17,
-    "contact_right":         0.17,
-    "power_left":            0.17,
-    "power_right":           0.17,
-    "plate_vision":          0.09,
-    "plate_discipline":      0.04,
-    "batting_clutch":        0.04,
-    "speed":                 0.05,
-    "fielding_ability":      0.03,
-    "arm_strength":          0.03,
-    "arm_accuracy":          0.02,
-    "reaction_time":         0.02,
-}
-
-_BLENDED_PITCHER_OVR = {
-    "pitch_velocity":        0.19,
-    "pitch_control":         0.19,
-    "pitch_movement":        0.19,
-    "pitching_clutch":       0.03,
-    "stamina":               0.03,
-    "k_per_9":               0.10,
-    "k_per_9_r":             0.05,
-    "k_per_9_l":             0.05,
-    "h_per_9":               0.05,
-    "h_per_9_r":             0.04,
-    "hr_per_9":              0.04,
-    "bb_per_9":              0.04,
+_DEFAULT_PITCHER_OVR = {
+    "pitch_velocity": 0.18, "pitch_control": 0.18, "pitch_movement": 0.18,
+    "pitching_clutch": 0.04, "stamina": 0.04,
+    "k_per_9": 0.08, "k_per_9_r": 0.05, "k_per_9_l": 0.05,
+    "h_per_9": 0.06, "h_per_9_r": 0.04, "hr_per_9": 0.04, "bb_per_9": 0.04,
 }
 
 
 def _position_is_hitter(pos: str) -> bool:
     return pos not in ("SP", "RP", "CP", "P")
 
-def _load_merged_ovr_weights() -> tuple[dict[str, float], dict[str, float]]:
-    """Load trained OVR weights and blend with blended defaults.
 
-    When trained Ridge coefficients exist (from train.py _fit_ovr_weights),
-    averages across hitter/pitcher positions, normalises to sum=1, and blends
-    70:30 trained:blended.  When no trained model exists, returns the
-    pre-tuned blended defaults so output always differs from the originals.
-    """
+def _load_merged_ovr_weights() -> tuple[dict[str, float], dict[str, float]]:
     trained = _load_ovr_weights()
     BLEND = 0.7
-    default_hitter = _BLENDED_HITTER_OVR
-    default_pitcher = _BLENDED_PITCHER_OVR
 
     def _avg_coefs(position_groups: list[str], default: dict) -> dict:
         merged = dict(default)
@@ -186,63 +168,55 @@ def _load_merged_ovr_weights() -> tuple[dict[str, float], dict[str, float]]:
             merged = {a: v / total_w for a, v in merged.items()}
         return merged
 
-    hitter_positions = [p for p in trained if _position_is_hitter(p)]
-    pitcher_positions = [p for p in trained if not _position_is_hitter(p)]
+    hitter_pos = [p for p in trained if _position_is_hitter(p)]
+    pitcher_pos = [p for p in trained if not _position_is_hitter(p)]
+    return _avg_coefs(hitter_pos, _DEFAULT_HITTER_OVR), _avg_coefs(pitcher_pos, _DEFAULT_PITCHER_OVR)
 
-    merged_hitter = _avg_coefs(hitter_positions, default_hitter)
-    merged_pitcher = _avg_coefs(pitcher_positions, default_pitcher)
-    return merged_hitter, merged_pitcher
 
-_MERGED_HITTER_OVR: dict[str, float] | None = None
-_MERGED_PITCHER_OVR: dict[str, float] | None = None
+_MERGED_HITTER_OVR: dict | None = None
+_MERGED_PITCHER_OVR: dict | None = None
+
 
 def _ovr_weight(attr: str, is_hitter: bool) -> float:
     global _MERGED_HITTER_OVR, _MERGED_PITCHER_OVR
-    if _MERGED_HITTER_OVR is None or _MERGED_PITCHER_OVR is None:
+    if _MERGED_HITTER_OVR is None:
         _MERGED_HITTER_OVR, _MERGED_PITCHER_OVR = _load_merged_ovr_weights()
     weights = _MERGED_HITTER_OVR if is_hitter else _MERGED_PITCHER_OVR
     return weights.get(attr, 0.02)
 
+
+# ── Default calibration fallback ───────────────────────────────────────────
+_DEFAULT_CAL = {"thresh": 2.0, "scale": 0.20, "max": 4.0}
+
 _ATTR_DEFAULTS = {
-    # Hitter core
-    "contact_left":          {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    "contact_right":         {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    "power_left":            {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    "power_right":           {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    # Hitter secondary
-    "plate_vision":          {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "plate_discipline":      {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    "batting_clutch":        {"thresh": 2.0, "scale": 0.20, "max": 5.0},
-    "speed":                 {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    # Fielding
-    "fielding_ability":      {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    "arm_strength":          {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    "arm_accuracy":          {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    "reaction_time":         {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    # Pitcher core
-    "pitch_velocity":        {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "pitch_control":         {"thresh": 2.0, "scale": 0.22, "max": 5.0},
-    "pitch_movement":        {"thresh": 2.0, "scale": 0.22, "max": 5.0},
-    "pitching_clutch":       {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "stamina":               {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    # Pitcher rate stats
-    "k_per_9":               {"thresh": 1.5, "scale": 0.22, "max": 5.0},
-    "hr_per_9":              {"thresh": 1.5, "scale": 0.22, "max": 5.0},
-    "k_per_9_r":             {"thresh": 1.5, "scale": 0.22, "max": 5.0},
-    "k_per_9_l":             {"thresh": 1.5, "scale": 0.22, "max": 5.0},
-    "h_per_9_r":             {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "h_per_9":               {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "bb_per_9":              {"thresh": 1.5, "scale": 0.22, "max": 5.0},
+    "contact_left": {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "contact_right": {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "power_left": {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "power_right": {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "plate_vision": {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "plate_discipline": {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "batting_clutch": {"thresh": 2.0, "scale": 0.20, "max": 5.0},
+    "speed": {"thresh": 2.0, "scale": 0.20, "max": 4.0},
+    "fielding_ability": {"thresh": 3.0, "scale": 0.15, "max": 3.0},
+    "arm_strength": {"thresh": 3.0, "scale": 0.15, "max": 3.0},
+    "arm_accuracy": {"thresh": 3.0, "scale": 0.15, "max": 3.0},
+    "reaction_time": {"thresh": 3.0, "scale": 0.15, "max": 3.0},
+    "pitch_velocity": {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "pitch_control": {"thresh": 2.0, "scale": 0.22, "max": 5.0},
+    "pitch_movement": {"thresh": 2.0, "scale": 0.22, "max": 5.0},
+    "pitching_clutch": {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "stamina": {"thresh": 3.0, "scale": 0.15, "max": 3.0},
+    "k_per_9": {"thresh": 1.5, "scale": 0.22, "max": 5.0},
+    "hr_per_9": {"thresh": 1.5, "scale": 0.22, "max": 5.0},
+    "k_per_9_r": {"thresh": 1.5, "scale": 0.22, "max": 5.0},
+    "k_per_9_l": {"thresh": 1.5, "scale": 0.22, "max": 5.0},
+    "h_per_9_r": {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "h_per_9": {"thresh": 1.5, "scale": 0.25, "max": 5.0},
+    "bb_per_9": {"thresh": 1.5, "scale": 0.22, "max": 5.0},
 }
 
 
 def _get_cal(attr: str, game_year: int = 26, ovr: int = 75) -> dict:
-    """Get calibration for an attribute, falling back to year→default.
-
-    Both threshold and max are scaled by OVR so elite cards need a larger
-    gap to change and have less headroom, while low-OVR cards are more
-    volatile with more room to grow.
-    """
     cal = _load_calibration()
     year_cal = cal.get(str(game_year), cal.get(game_year, {}))
     if attr in year_cal:
@@ -251,9 +225,8 @@ def _get_cal(attr: str, game_year: int = 26, ovr: int = 75) -> dict:
         c = _ATTR_DEFAULTS[attr]
     else:
         c = _DEFAULT_CAL
-    factor = _ovr_factor(ovr)
-    # Lower threshold for low-OVR (easier to trigger change), higher for elite
-    thresh_factor = 1.0 + (ovr - 75) / 75 * 0.4  # 0.6x at OVR 0, 1.0 at OVR 75, 1.13 at OVR 99
+    thresh_factor = 1.0 + (ovr - 75) / 75 * 0.4
+    factor = 1.0 + max(0, (99 - ovr) / 99) * 0.75
     return {
         "thresh": c["thresh"] * thresh_factor,
         "scale": c["scale"],
@@ -262,11 +235,10 @@ def _get_cal(attr: str, game_year: int = 26, ovr: int = 75) -> dict:
 
 
 def _ovr_factor(ovr: int) -> float:
-    """Scale max delta for low-OVR cards — modest room to grow."""
     return 1.0 + max(0, (99 - ovr) / 99) * 0.75
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────
 
 def _get_historical_deltas() -> dict[str, list[float]]:
     conn = sqlite3.connect(str(DB_PATH))
@@ -339,17 +311,179 @@ def _extract_windows(row: pd.Series) -> tuple[dict, bool]:
     return windows, has_data
 
 
-# ─── Per-attribute prediction ────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  Signal 1: Multi-window gap projection (project as-if-update-were-today)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def signal1_predict(
+    attr: str,
+    row: pd.Series,
+    windows: dict,
+    has_data: bool,
+) -> float:
+    """Signal 1: calibrated multi-window gap projection.
+
+    Always projects as if the update were today — uses blended gap_today
+    from all available windows (35% 7d, 30% 14d, 20% 21d, 15% YTD).
+    """
+    attr = normalize_attr_name(attr)
+    rating = float(row.get("rating_before", row.get("current_rating", 60)))
+    ovr = int(row.get("current_ovr", row.get("ovr_before", 75)))
+    is_hitter = bool(row.get("is_hitter", True))
+    game_year = int(row.get("game_year", 26))
+
+    # Compute multi-window projections → gaps
+    projs = compute_window_projections(attr, windows, is_hitter)
+    gaps = compute_window_gaps(projs, int(rating))
+
+    # Use gap_today as primary signal (weighted blend of all windows)
+    gap_today = gaps.get("gap_today", gaps.get("gap_21d", 0.0))
+
+    # Fall back to gap_21d if today/blend not available
+    if gap_today == 0.0 and abs(gaps.get("gap_21d", 0.0)) > 0:
+        gap_today = gaps["gap_21d"]
+
+    # Calibrated magnitude
+    cal = _get_cal(attr, game_year, ovr)
+
+    if attr == "stamina" and not has_data:
+        return 0.0
+
+    if has_data and abs(gap_today) >= cal["thresh"]:
+        delta = gap_today * cal["scale"]
+        return max(-cal["max"], min(cal["max"], delta))
+    elif not has_data and abs(gap_today) >= 2.5:
+        delta = gap_today * 0.10
+        return max(-3.0, min(3.0, delta))
+    else:
+        return 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Signal 2: Direct regression (LightGBM → delta)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def signal2_predict(
+    attr: str,
+    row: pd.Series,
+) -> float:
+    """Signal 2: gradient boosted regression directly predicting delta.
+
+    Uses the trained LightGBM regressor with all engineered features.
+    """
+    is_hitter = bool(row.get("is_hitter", True))
+    label = "hitter" if is_hitter else "pitcher"
+
+    models = _load_regression()
+    model = models.get(label)
+    if model is None or (isinstance(model, dict) and model.get("dummy")):
+        return 0.0
+
+    try:
+        X = np.array([row.get(f, 0.0) for f in REGRESSION_FEATURES]).reshape(1, -1)
+        X = np.nan_to_num(X, nan=0.0)
+        pred = float(model.predict(X)[0])
+        return max(-8.0, min(8.0, pred))
+    except Exception:
+        return 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Signal 3: Historical analog matching (k-NN weighted outcome)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def signal3_predict(
+    attr: str,
+    row: pd.Series,
+    windows: dict,
+    k: int = 20,
+) -> float:
+    """Signal 3: find k most similar historical players, weight their outcomes.
+
+    Uses cosine similarity in the analog feature space.
+    Returns weighted average of the k nearest neighbors' actual deltas.
+    """
+    index = _load_analog_index()
+    if not index or "vectors" not in index:
+        return 0.0
+
+    feature_names = index["feature_names"]
+    mean = np.array(index["feature_mean"])
+    std = np.array(index["feature_std"])
+    vectors = index["vectors"]
+    outcomes = np.array(index["outcomes"])
+
+    # Build current player's analog feature vector
+    feat_vals = []
+    for fname in feature_names:
+        val = row.get(fname, 0.0)
+        if pd.isna(val) or val is None:
+            val = 0.0
+        feat_vals.append(float(val))
+    x = np.array(feat_vals, dtype=np.float64)
+    x_norm = (x - mean) / std
+
+    # Cosine similarity
+    sims = cosine_similarity(x_norm.reshape(1, -1), vectors)[0]
+
+    # Top-k
+    k = min(k, len(sims))
+    top_idx = np.argsort(sims)[::-1][:k]
+    top_sims = sims[top_idx]
+    top_outcomes = outcomes[top_idx]
+
+    # Weight by similarity (only positive similarities)
+    weights = np.maximum(top_sims, 0.0)
+    total_w = weights.sum()
+    if total_w < 0.01:
+        return 0.0
+
+    weighted_avg = float(np.dot(weights, top_outcomes) / total_w)
+    return max(-8.0, min(8.0, weighted_avg))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Confidence interval from bucketed errors
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _compute_confidence_interval(
+    gap_today: float,
+    predicted_delta: float,
+    has_data: bool,
+) -> tuple[float, float]:
+    """Return (low, high) confidence bounds around predicted_delta.
+
+    Finds the gap bucket from calibration and applies the percentile errors.
+    When no data or no bucket matches, returns ±2.
+    """
+    if not has_data:
+        return (predicted_delta - 2.0, predicted_delta + 2.0)
+
+    buckets = _load_confidence_buckets()
+    abs_gap = abs(gap_today)
+    for bucket in buckets:
+        if bucket["min_gap"] <= abs_gap < bucket["max_gap"]:
+            p10 = bucket["p10"]
+            p90 = bucket["p90"]
+            # Weight the interval: wider for larger predicted deltas
+            return (predicted_delta - p90, predicted_delta + p90)
+
+    return (predicted_delta - 2.0, predicted_delta + 2.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Per-attribute prediction (ensembles all 3 signals)
+# ═══════════════════════════════════════════════════════════════════════════
 
 def predict_attr_delta(
     attr: str,
     row: pd.Series,
-    hist_deltas: dict[str, list[float]],
-) -> tuple[float, float, float]:
-    """Predict delta, change probability, and formula gap for one attribute.
+    hist_deltas: dict[str, list[float]] | None = None,
+) -> tuple[float, float, float, float, float]:
+    """Predict delta for one attribute using ensemble of 3 signals.
 
     Returns:
-      (predicted_delta, change_prob, actual_gap)
+      (predicted_delta, change_prob, confidence_low, confidence_high, gap_today)
     """
     attr = normalize_attr_name(attr)
     rating = float(row.get("rating_before", row.get("current_rating", 60)))
@@ -361,85 +495,68 @@ def predict_attr_delta(
 
     windows, has_data = _extract_windows(row)
 
-    # 1. Formula projection → gap (always compute, even without stat data)
-    primary = windows.get("21d", windows.get("ytd", {}))
-    proj = project_attribute(attr, primary, is_hitter)
-    gap = float(proj) - rating if proj is not None else 0.0
-    proj_ytd = project_attribute(attr, windows.get("ytd", {}), is_hitter)
-    gap_ytd = float(proj_ytd) - rating if proj_ytd is not None else 0.0
+    # Compute gap_today for confidence & change_prob
+    projs = compute_window_projections(attr, windows, is_hitter)
+    gaps_dict = compute_window_gaps(projs, int(rating))
+    gap_today = gaps_dict.get("gap_today", gaps_dict.get("gap_21d", 0.0))
+    if gap_today == 0.0 and abs(gaps_dict.get("gap_21d", 0.0)) > 0:
+        gap_today = gaps_dict["gap_21d"]
 
-    # 2. Change probability from classifier
-    if has_data:
-        clf = _load_classifiers()
-        label = "hitter" if is_hitter else "pitcher"
-        if label in clf and not isinstance(clf[label], dict) or (label in clf and hasattr(clf[label], "predict_proba")):
-            try:
-                feats = _classifier_features(row, gap, windows)
-                prob = float(clf[label].predict_proba([feats])[0, 1])
-                prob = max(0.01, min(0.95, prob))
-            except Exception:
-                prob = _fallback_change_prob(gap)
-        else:
-            prob = _fallback_change_prob(gap)
-    else:
-        prob = _fallback_change_prob(gap)
+    # Signal 1: multi-window gap projection
+    s1 = signal1_predict(attr, row, windows, has_data)
 
-    # 3. Calibrated magnitude
-    cal = _get_cal(attr, game_year, ovr)
-    # Stamina: skip entirely when no stat data (missing IP causes false gaps)
-    if attr == "stamina" and not has_data:
-        predicted = 0.0
-    elif has_data and abs(gap) >= cal["thresh"]:
-        predicted = gap * cal["scale"]
-        predicted = max(-cal["max"], min(cal["max"], predicted))
-    elif not has_data and abs(gap) >= 2.5:
-        predicted = gap * 0.10
-        predicted = max(-3.0, min(3.0, predicted))
-    else:
-        predicted = 0.0
+    # Signal 2: direct regression
+    s2 = signal2_predict(attr, row)
 
-    # 4. Simple trend overlay
+    # Signal 3: analog matching
+    s3 = signal3_predict(attr, row, windows)
+
+    # Ensemble blend
+    weights = _load_ensemble_weights()
+    label = "hitter" if is_hitter else "pitcher"
+    w = weights.get(label, {"w_signal1": 0.40, "w_signal2": 0.40, "w_signal3": 0.20})
+
+    # Dynamic weight adjustment: when no stat data, rely less on s1
+    if not has_data:
+        w["w_signal1"] = 0.20
+        w["w_signal2"] = 0.60
+        w["w_signal3"] = 0.20
+    # When no regression model, rely more on gap
+    reg_models = _load_regression()
+    if label not in reg_models or (isinstance(reg_models.get(label), dict) and reg_models[label].get("dummy")):
+        w["w_signal1"] = 0.60
+        w["w_signal2"] = 0.0
+        w["w_signal3"] = 0.40
+
+    total = w["w_signal1"] + w["w_signal2"] + w["w_signal3"]
+    if total > 0:
+        w = {k: v / total for k, v in w.items()}
+
+    predicted = s1 * w["w_signal1"] + s2 * w["w_signal2"] + s3 * w["w_signal3"]
+
+    # Simple trend overlay (from old system, still useful)
     if mlb_id and abs(predicted) > 0.5:
         trend = _get_player_trend(mlb_id, attr)
         if abs(trend) > 0.5 and np.sign(trend) == np.sign(predicted):
-            predicted += trend * 0.20
+            predicted += trend * 0.15
+            cal = _get_cal(attr, game_year, ovr)
             predicted = max(-cal["max"], min(cal["max"], predicted))
 
-    return predicted, prob, round(gap, 1)
+    # Clip
+    predicted = max(-8.0, min(8.0, predicted))
+
+    # Change probability: logistic from gap_today
+    change_prob = 0.55 / (1.0 + np.exp(-0.5 * (abs(gap_today) - 4.0)))
+
+    # Confidence interval
+    conf_low, conf_high = _compute_confidence_interval(gap_today, predicted, has_data)
+
+    return predicted, change_prob, conf_low, conf_high, round(gap_today, 1)
 
 
-def _fallback_change_prob(gap: float) -> float:
-    """Continuous logistic probability from |gap| magnitude.
-
-    Smooth s-curve: prob ~0.03 at gap=0, 0.12 at gap=3, 0.40 at gap=6,
-    asymptoting at 0.55.  Much more realistic than the old step function.
-    """
-    abs_gap = abs(gap)
-    return 0.55 / (1.0 + np.exp(-0.5 * (abs_gap - 4.0)))
-
-
-def _classifier_features(row: pd.Series, gap: float, windows: dict) -> list:
-    """Build feature vector for change classifier."""
-    primary = windows.get("21d", windows.get("ytd", {}))
-    ovr = int(row.get("current_ovr", row.get("ovr_before", 75)))
-    return [
-        gap,
-        abs(gap),
-        gap - ovr,
-        row.get("days_since_last_update", 7),
-        ovr_distance_to_tier_boundary(ovr),
-        int(row.get("is_established_star", 0)),
-        int(sample_size_ok(primary, bool(row.get("is_hitter", True)))),
-        primary.get("k_pct", 0.225) * 100,
-        primary.get("bb_pct", 0.085) * 100,
-        primary.get("avg", 0.248),
-        primary.get("iso", 0.155),
-        primary.get("k9", 8.7),
-        primary.get("bb9", 3.1),
-    ]
-
-
-# ─── DataFrame pipeline ──────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  DataFrame pipeline
+# ═══════════════════════════════════════════════════════════════════════════
 
 def predict_attributes(df: pd.DataFrame) -> pd.DataFrame:
     hist = _get_historical_deltas()
@@ -451,7 +568,7 @@ def predict_attributes(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         rating = float(row.get("rating_before", row.get("current_rating", 60)))
-        delta, prob, formula_gap = predict_attr_delta(attr, row, hist)
+        delta, prob, conf_low, conf_high, formula_gap = predict_attr_delta(attr, row, hist)
         new_rating = rating + delta
 
         delta_strength = min(1.0, abs(delta) / 2.0)
@@ -480,7 +597,10 @@ def predict_attributes(df: pd.DataFrame) -> pd.DataFrame:
             "projected_rating": int(round(new_rating)),
             "predicted_delta": round(delta, 1),
             "gap": formula_gap,
+            "gap_today": formula_gap,
             "change_prob": round(prob, 3),
+            "confidence_low": round(conf_low, 1),
+            "confidence_high": round(conf_high, 1),
             "upgrade_prob_attr": round(up_prob, 3),
             "downgrade_prob_attr": round(dn_prob, 3),
             "confidence_score": 30 if row.get("mlb_player_id") else 0,
@@ -491,18 +611,42 @@ def predict_attributes(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(results)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Player-level aggregation
+# ═══════════════════════════════════════════════════════════════════════════
+
+_TIER_BOUNDARIES = [65, 75, 85, 90, 95]
+
+_QS_TIERS = [
+    (0, 25), (65, 100), (75, 300), (80, 600),
+    (85, 1000), (90, 5000), (92, 10000),
+    (94, 25000), (95, 50000), (97, 100000),
+]
+
+
+def _qs_value(ovr: int) -> int:
+    return max((v for k, v in _QS_TIERS if ovr >= k), default=0)
+
+
+def _calibrated_prob(gap_today: float, direction: str = "up") -> float:
+    """Get calibrated probability from market_calibration.json buckets."""
+    market_cal = _load_market_cal()
+    buckets = market_cal.get("prob_buckets", [])
+    if not buckets:
+        return 0.5
+    abs_gap = abs(gap_today)
+    # Find the bucket this gap falls into
+    for i, bucket in enumerate(buckets):
+        if i < len(buckets) - 1:
+            next_mid = buckets[i + 1]["gap_mid"]
+            if abs_gap >= bucket["gap_mid"] and abs_gap < next_mid:
+                return bucket.get(f"p_{direction}", bucket.get("p_up" if direction == "up" else "p_down", 0.5))
+    last = buckets[-1]
+    return last.get(f"p_{direction}", last.get("p_up" if direction == "up" else "p_down", 0.5))
+
+
 def aggregate_player_predictions(attr_df: pd.DataFrame) -> pd.DataFrame:
-    """Roll per-attribute predictions up to player-level OVR delta.
-
-    Uses per-attribute OVR weights blended from trained Ridge coefficients
-    and domain defaults.  Key improvements over the original:
-
-    1. Tier-aware OVR multiplier (boost near rarity boundaries)
-    2. Both-direction tier-jump probability (upgrade AND downgrade)
-    3. Direction consensus weighted by attribute OVR importance
-    4. Dynamic investment-score weights based on OVR context
-    5. Momentum factor from recent player trend
-    """
+    """Roll per-attribute predictions up to player-level OVR delta w/ market sim."""
     attr_df = attr_df.copy()
     attr_df["is_hitter"] = attr_df["is_hitter"].astype(bool)
     attr_df["ovr_weight"] = attr_df.apply(
@@ -518,38 +662,51 @@ def aggregate_player_predictions(attr_df: pd.DataFrame) -> pd.DataFrame:
             weighted_sum=("weighted_delta", "sum"),
             n_up=("predicted_delta", lambda s: (s > 0.1).sum()),
             n_down=("predicted_delta", lambda s: (s < -0.1).sum()),
-            # Weighted direction: sum of weighted positive/negative deltas
             weighted_up_sum=("weighted_delta", lambda s: s[s > 0].sum()),
             weighted_down_sum=("weighted_delta", lambda s: s[s < 0].sum()),
             change_prob_mean=("change_prob", "mean"),
             up_prob_mean=("upgrade_prob_attr", "mean"),
             dn_prob_mean=("downgrade_prob_attr", "mean"),
             avg_abs_delta=("abs_delta", "mean"),
+            avg_gap_today=("gap_today", "mean"),
+            avg_confidence_low=("confidence_low", "mean"),
+            avg_confidence_high=("confidence_high", "mean"),
         )
         .reset_index()
     )
 
-    # ── Tier-aware OVR multiplier ────────────────────────────────────────
-    # Near tier boundaries, SDS tends to push players across; boost multiplier.
-    _TIER_BOUNDARIES = [65, 75, 85, 90, 95]
+    # OVR delta from weighted sum of attribute deltas
+    # Use trained OVR weights (already applied), no arbitrary multiplier
+    grouped["predicted_ovr_delta"] = (grouped["weighted_sum"] * 1.5).clip(-8.0, 8.0)
+
+    # Tier-aware boost near boundaries (small, data-driven)
     def _tier_boost(ovr):
         dist = min(abs(ovr - b) for b in _TIER_BOUNDARIES)
         if dist <= 2:
-            return 0.3 * (2 - dist) / 2  # up to +0.3x when right on boundary
+            return 0.15 * (2 - dist) / 2
         return 0.0
+    boost = grouped["current_ovr"].apply(_tier_boost)
+    grouped["predicted_ovr_delta"] = (grouped["predicted_ovr_delta"] * (1.0 + boost)).clip(-8.0, 8.0)
 
-    ovr = grouped["current_ovr"]
-    base_mult = 1.5 - 0.3 * (ovr / 99.0)
-    boost = ovr.apply(_tier_boost)
-    grouped["ovr_mult"] = (base_mult + boost).clip(1.0, 2.5)
-    grouped["predicted_ovr_delta"] = (grouped["weighted_sum"] * grouped["ovr_mult"]).clip(-8.0, 8.0)
+    # Directional probabilities from calibrated gap→prob mapping
+    def _ovr_probs(row):
+        gap = row["avg_gap_today"]
+        p_up = _calibrated_prob(gap, "up")
+        p_down = _calibrated_prob(gap, "down")
+        # Scale by direction
+        if row["predicted_ovr_delta"] > 0:
+            p_up = min(0.99, p_up * 1.2)
+            p_down = max(0.01, p_down * 0.8)
+        elif row["predicted_ovr_delta"] < 0:
+            p_down = min(0.99, p_down * 1.2)
+            p_up = max(0.01, p_up * 0.8)
+        return pd.Series({"upgrade_probability": p_up, "downgrade_probability": p_down})
 
-    # ── Directional probabilities (logistic, delta→probability) ──────────
-    z = grouped["predicted_ovr_delta"] / 2.0
-    grouped["upgrade_probability"] = (1.0 / (1.0 + np.exp(-z))).clip(0.01, 0.99)
-    grouped["downgrade_probability"] = 1.0 - grouped["upgrade_probability"]
+    probs = grouped.apply(_ovr_probs, axis=1)
+    grouped["upgrade_probability"] = probs["upgrade_probability"]
+    grouped["downgrade_probability"] = probs["downgrade_probability"]
 
-    # ── Bi-directional tier-jump probability ─────────────────────────────
+    # Tier-jump probability
     def _tier_jump(row):
         d = row["predicted_ovr_delta"]
         c = row["current_ovr"]
@@ -566,68 +723,75 @@ def aggregate_player_predictions(attr_df: pd.DataFrame) -> pd.DataFrame:
                     prob = min(0.50, 0.10 + (-d - (c - ub)) * 0.10)
                     best = max(best, prob)
         return best
-
     grouped["tier_jump_probability"] = grouped.apply(_tier_jump, axis=1)
 
-    # ── Attribute-importance-weighted direction consensus ────────────────
-    # Instead of simple n_up/n_down count, use weighted proportion so
-    # that movement in high-importance attrs (contact/power/velo) counts more.
+    # Direction consensus
     total_w = grouped["weighted_up_sum"].abs() + grouped["weighted_down_sum"].abs()
-    # Zero movement → neutral consensus (0), not -1
     no_movement = total_w < 0.001
     safe_total = total_w.clip(lower=0.01)
     pct_up_weighted = grouped["weighted_up_sum"].clip(lower=0) / safe_total
     grouped["direction_consensus"] = np.where(no_movement, 0.0, (2 * pct_up_weighted - 1).clip(-1, 1))
-    grouped["avg_gap"] = grouped["weighted_sum"] / grouped["n_attrs"].clip(lower=1)
-    grouped["avg_magnitude"] = grouped["avg_abs_delta"]
 
-    # ── Dynamic investment score ─────────────────────────────────────────
-    # Base weights shift based on OVR context:
-    #   Low OVR (<75):  upgrade potential dominates
-    #   Mid OVR (75-89): balanced
-    #   High OVR (90+):  tier jumps (red diamond) matter most
-    def _investment_score(row):
+    # ── Market-simulated investment score ──────────────────────────────
+    # Expected Value = P(up) * profit_up + P(down) * profit_down + P(hold) * 0
+    # profit_up = QS(new_ovr) - QS(current_ovr)
+    # profit_down = QS(new_ovr) - QS(current_ovr) (negative = loss)
+    def _expected_value(row):
         ovr = row["current_ovr"]
-        up_w, dir_w, tier_w, delta_w = 0.35, 0.15, 0.25, 0.25
+        delta = row["predicted_ovr_delta"]
+        p_up = row["upgrade_probability"]
+        p_down = row["downgrade_probability"]
 
-        if ovr < 75:
-            up_w, dir_w, tier_w, delta_w = 0.45, 0.10, 0.15, 0.30
-        elif ovr >= 90:
-            up_w, dir_w, tier_w, delta_w = 0.25, 0.10, 0.40, 0.25
+        # Project new OVR
+        new_ovr_up = min(99, max(0, ovr + int(round(abs(delta)))))
+        new_ovr_down = min(99, max(0, ovr - int(round(abs(delta)))))
 
-        # Boost tier weight near boundaries
-        if any(abs(ovr - b) <= 3 for b in _TIER_BOUNDARIES):
-            tier_w = min(0.45, tier_w + 0.10)
-            up_w = max(0.20, up_w - 0.05)
+        cur_qs = _qs_value(ovr)
+        qs_up = _qs_value(new_ovr_up)
+        qs_down = _qs_value(new_ovr_down)
 
-        # Normalise weights to sum 1.0
-        total = up_w + dir_w + tier_w + delta_w
-        up_w /= total
-        dir_w /= total
-        tier_w /= total
-        delta_w /= total
+        profit_up = qs_up - cur_qs
+        profit_down = qs_down - cur_qs
 
-        # Normalised components (all 0–1 range)
-        up_comp = row["upgrade_probability"]
-        dir_comp = (row["direction_consensus"] + 1) / 2
-        tier_comp = row["tier_jump_probability"]
-        delta_comp = (np.clip(row["predicted_ovr_delta"], -2, 5) + 2) / 7
+        ev = p_up * profit_up + p_down * profit_down
 
-        # Momentum bonus: players with strong +weighted direction get a lift
-        momentum = max(0.0, row["direction_consensus"]) * 0.05
+        # Apply stack limit (max 20)
+        total_ev = ev * 20
 
-        return (
-            up_comp * up_w
-            + dir_comp * dir_w
-            + tier_comp * tier_w
-            + delta_comp * delta_w
-            + momentum
-        )
+        # ROI if we buy at current QS
+        if cur_qs > 0:
+            roi = (ev / cur_qs) * 100
+        else:
+            roi = 0.0
 
-    grouped["investment_score"] = grouped.apply(_investment_score, axis=1)
+        # Final score: blend EV and tier-jump potential
+        score = ev + row["tier_jump_probability"] * 500
+
+        return pd.Series({
+            "investment_score": round(score, 0),
+            "expected_value_per_card": round(ev, 0),
+            "total_ev_20_stack": round(total_ev, 0),
+            "roi_pct": round(roi, 1),
+            "current_qs": cur_qs,
+            "projected_qs_up": qs_up,
+            "projected_qs_down": qs_down,
+        })
+
+    ev_metrics = grouped.apply(_expected_value, axis=1)
+    grouped["investment_score"] = ev_metrics["investment_score"]
+    grouped["expected_value_per_card"] = ev_metrics["expected_value_per_card"]
+    grouped["total_ev_20_stack"] = ev_metrics["total_ev_20_stack"]
+    grouped["roi_pct"] = ev_metrics["roi_pct"]
+    grouped["current_qs"] = ev_metrics["current_qs"]
+    grouped["projected_qs_up"] = ev_metrics["projected_qs_up"]
+    grouped["projected_qs_down"] = ev_metrics["projected_qs_down"]
 
     return grouped.sort_values("investment_score", ascending=False)
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Top-level orchestrator
+# ═══════════════════════════════════════════════════════════════════════════
 
 def run_predictions(
     live_df: pd.DataFrame,
@@ -659,13 +823,17 @@ def run_predictions(
                     sample_size_ok=1,
                     horizon_days=horizon_days,
                     attributes_json=dumps(attrs.to_dict(orient="records")),
-                    avg_gap=float(row.get("avg_gap", 0.0)),
+                    avg_gap=float(row.get("avg_gap_today", 0.0)),
                     direction_consensus=float(row.get("direction_consensus", 0.5)),
                 ))
             session.commit()
 
     return player_preds
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Utility functions
+# ═══════════════════════════════════════════════════════════════════════════
 
 def is_roster_update_today() -> dict:
     from datetime import datetime, timedelta
@@ -710,9 +878,8 @@ def expected_stub_profit(
 ) -> dict:
     new_ovr = int(current_ovr + round(predicted_delta))
     new_ovr = max(0, min(99, new_ovr))
-    tiers = [(0, 25), (65, 100), (75, 300), (80, 600), (85, 1000), (90, 5000), (92, 10000), (94, 25000), (95, 50000), (97, 100000)]
-    cur_qs = max((v for k, v in tiers if current_ovr >= k), default=0)
-    new_qs = max((v for k, v in tiers if new_ovr >= k), default=0)
+    cur_qs = _qs_value(current_ovr)
+    new_qs = _qs_value(new_ovr)
     cost = buy_price if buy_price else cur_qs
     ppc = max(0, new_qs - cost)
     return {

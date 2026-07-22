@@ -112,7 +112,7 @@ class MLBStatsClient:
         games = _extract_game_log(data)
         end_dt = datetime.strptime(end_date, "%Y-%m-%d")
         windows = {}
-        for label, days in [("5d", 5), ("21d", 21), ("ytd", 9999)]:
+        for label, days in [("7d", 7), ("14d", 14), ("21d", 21), ("ytd", 9999)]:
             start_dt = end_dt - timedelta(days=days - 1) if days < 9999 else datetime(season, 1, 1)
             subset = [
                 g for g in games
@@ -360,7 +360,8 @@ def build_live_stat_windows(
         game_log_windows = {"5d": {"games": 0}, "21d": {"games": 0}, "ytd": {"games": 0}}
 
     # Determine which windows actually have games logged
-    has_5d = game_log_windows.get("5d", {}).get("games", 0) > 0
+    has_7d = game_log_windows.get("7d", {}).get("games", 0) > 0
+    has_14d = game_log_windows.get("14d", {}).get("games", 0) > 0
     has_21d = game_log_windows.get("21d", {}).get("games", 0) > 0
     has_ytd = game_log_windows.get("ytd", {}).get("games", 0) > 0
 
@@ -376,23 +377,14 @@ def build_live_stat_windows(
     three_yr = _blend_three_year({str(season - 2 + i): s for i, s in enumerate(yr_stats) if s}, is_hitter)
 
     # Build windows: prefer game-log rolling data, fall back to season stats
-    if has_5d:
-        window_5d = game_log_windows["5d"]
-    else:
-        window_5d = season_window
-
-    if has_21d:
-        window_21d = game_log_windows["21d"]
-    else:
-        window_21d = season_window
-
-    if has_ytd:
-        window_ytd = game_log_windows["ytd"]
-    else:
-        window_ytd = season_window
+    window_7d = game_log_windows.get("7d", season_window) if has_7d else season_window
+    window_14d = game_log_windows.get("14d", season_window) if has_14d else season_window
+    window_21d = game_log_windows.get("21d", season_window) if has_21d else season_window
+    window_ytd = game_log_windows.get("ytd", season_window) if has_ytd else season_window
 
     windows = {
-        "5d": window_5d,
+        "7d": window_7d,
+        "14d": window_14d,
         "21d": window_21d,
         "ytd": window_ytd,
         "3yr": three_yr or season_window,
@@ -516,7 +508,7 @@ def store_stat_windows_for_updates(game_years: list[int] | None = None) -> int:
                     .filter_by(mlb_player_id=mlb_id, as_of_date=update_date)
                     .count()
                 )
-                if existing_count >= 4:
+                if existing_count >= 6:
                     continue
 
                 season = int(update_date[:4])
