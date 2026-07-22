@@ -186,33 +186,39 @@ def _ovr_weight(attr: str, is_hitter: bool) -> float:
 
 
 # ── Default calibration fallback ───────────────────────────────────────────
-_DEFAULT_CAL = {"thresh": 2.0, "scale": 0.20, "max": 4.0}
+# Conservative values to prevent extreme predictions:
+# - threshold: minimum |gap| before predicting any change (higher = fewer changes)
+# - scale: what fraction of the gap to apply as delta (lower = smaller changes)
+# - max: maximum absolute delta per attribute
+# The old values (thresh=2, scale=0.20) produced -6 to -8 OVR deltas for
+# high-OVR players because formulas systematically project 50-76 vs 90+ card.
+_DEFAULT_CAL = {"thresh": 5.0, "scale": 0.08, "max": 3.0}
 
 _ATTR_DEFAULTS = {
-    "contact_left": {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    "contact_right": {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    "power_left": {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    "power_right": {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    "plate_vision": {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "plate_discipline": {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    "batting_clutch": {"thresh": 2.0, "scale": 0.20, "max": 5.0},
-    "speed": {"thresh": 2.0, "scale": 0.20, "max": 4.0},
-    "fielding_ability": {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    "arm_strength": {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    "arm_accuracy": {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    "reaction_time": {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    "pitch_velocity": {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "pitch_control": {"thresh": 2.0, "scale": 0.22, "max": 5.0},
-    "pitch_movement": {"thresh": 2.0, "scale": 0.22, "max": 5.0},
-    "pitching_clutch": {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "stamina": {"thresh": 3.0, "scale": 0.15, "max": 3.0},
-    "k_per_9": {"thresh": 1.5, "scale": 0.22, "max": 5.0},
-    "hr_per_9": {"thresh": 1.5, "scale": 0.22, "max": 5.0},
-    "k_per_9_r": {"thresh": 1.5, "scale": 0.22, "max": 5.0},
-    "k_per_9_l": {"thresh": 1.5, "scale": 0.22, "max": 5.0},
-    "h_per_9_r": {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "h_per_9": {"thresh": 1.5, "scale": 0.25, "max": 5.0},
-    "bb_per_9": {"thresh": 1.5, "scale": 0.22, "max": 5.0},
+    "contact_left":          {"thresh": 5.0, "scale": 0.08, "max": 3.0},
+    "contact_right":         {"thresh": 5.0, "scale": 0.08, "max": 3.0},
+    "power_left":            {"thresh": 5.0, "scale": 0.08, "max": 3.0},
+    "power_right":           {"thresh": 5.0, "scale": 0.08, "max": 3.0},
+    "plate_vision":          {"thresh": 4.0, "scale": 0.10, "max": 4.0},
+    "plate_discipline":      {"thresh": 5.0, "scale": 0.08, "max": 3.0},
+    "batting_clutch":        {"thresh": 5.0, "scale": 0.08, "max": 3.0},
+    "speed":                 {"thresh": 5.0, "scale": 0.08, "max": 3.0},
+    "fielding_ability":      {"thresh": 6.0, "scale": 0.05, "max": 2.0},
+    "arm_strength":          {"thresh": 6.0, "scale": 0.05, "max": 2.0},
+    "arm_accuracy":          {"thresh": 6.0, "scale": 0.05, "max": 2.0},
+    "reaction_time":         {"thresh": 6.0, "scale": 0.05, "max": 2.0},
+    "pitch_velocity":        {"thresh": 4.0, "scale": 0.10, "max": 4.0},
+    "pitch_control":         {"thresh": 5.0, "scale": 0.08, "max": 3.0},
+    "pitch_movement":        {"thresh": 5.0, "scale": 0.08, "max": 3.0},
+    "pitching_clutch":       {"thresh": 5.0, "scale": 0.08, "max": 3.0},
+    "stamina":               {"thresh": 6.0, "scale": 0.05, "max": 2.0},
+    "k_per_9":               {"thresh": 4.0, "scale": 0.10, "max": 4.0},
+    "hr_per_9":              {"thresh": 4.0, "scale": 0.10, "max": 4.0},
+    "k_per_9_r":             {"thresh": 4.0, "scale": 0.10, "max": 4.0},
+    "k_per_9_l":             {"thresh": 4.0, "scale": 0.10, "max": 4.0},
+    "h_per_9_r":             {"thresh": 5.0, "scale": 0.08, "max": 3.0},
+    "h_per_9":               {"thresh": 5.0, "scale": 0.08, "max": 3.0},
+    "bb_per_9":              {"thresh": 4.0, "scale": 0.10, "max": 4.0},
 }
 
 
@@ -220,22 +226,23 @@ def _get_cal(attr: str, game_year: int = 26, ovr: int = 75) -> dict:
     cal = _load_calibration()
     year_cal = cal.get(str(game_year), cal.get(game_year, {}))
     if attr in year_cal:
-        c = year_cal[attr]
+        c = dict(year_cal[attr])
+        # Clamp old aggressive calibration to conservative defaults
+        d = _ATTR_DEFAULTS.get(attr, _DEFAULT_CAL)
+        c["thresh"] = max(c["thresh"], d["thresh"])
+        c["scale"] = min(c["scale"], d["scale"])
+        c["max"] = min(c["max"], d["max"])
     elif attr in _ATTR_DEFAULTS:
         c = _ATTR_DEFAULTS[attr]
     else:
         c = _DEFAULT_CAL
-    thresh_factor = 1.0 + (ovr - 75) / 75 * 0.4
-    factor = 1.0 + max(0, (99 - ovr) / 99) * 0.75
+    # Scale threshold by OVR: elite cards need larger gap to change
+    thresh_factor = 1.0 + max(0, (ovr - 75) / 99) * 0.3
     return {
         "thresh": c["thresh"] * thresh_factor,
         "scale": c["scale"],
-        "max": c["max"] * factor,
+        "max": c["max"],
     }
-
-
-def _ovr_factor(ovr: int) -> float:
-    return 1.0 + max(0, (99 - ovr) / 99) * 0.75
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -325,6 +332,10 @@ def signal1_predict(
 
     Always projects as if the update were today — uses blended gap_today
     from all available windows (35% 7d, 30% 14d, 20% 21d, 15% YTD).
+
+    Gap is clamped to ±15 before scale to prevent formula's systematic
+    underprediction of elite cards (formulas produce 50-76 for league avg
+    stats, while top cards are 90+) from generating crazy deltas.
     """
     attr = normalize_attr_name(attr)
     rating = float(row.get("rating_before", row.get("current_rating", 60)))
@@ -332,31 +343,37 @@ def signal1_predict(
     is_hitter = bool(row.get("is_hitter", True))
     game_year = int(row.get("game_year", 26))
 
+    # No stat data and attr has no real formula → can't predict
+    if not has_data and attr in ("fielding_ability", "arm_strength", "arm_accuracy",
+                                  "reaction_time", "stamina", "speed",
+                                  "bunting_ability", "drag_bunting_ability",
+                                  "blocking", "baserunning_aggression",
+                                  "baserunning_ability", "hitting_durability",
+                                  "fielding_durability"):
+        return 0.0
+
     # Compute multi-window projections → gaps
     projs = compute_window_projections(attr, windows, is_hitter)
     gaps = compute_window_gaps(projs, int(rating))
 
-    # Use gap_today as primary signal (weighted blend of all windows)
     gap_today = gaps.get("gap_today", gaps.get("gap_21d", 0.0))
-
-    # Fall back to gap_21d if today/blend not available
     if gap_today == 0.0 and abs(gaps.get("gap_21d", 0.0)) > 0:
         gap_today = gaps["gap_21d"]
 
-    # Calibrated magnitude
+    # Clamp extreme gaps: formulas systematically underrate elite cards,
+    # so a gap of -40 doesn't mean a -8 delta is coming
+    gap_today = max(-15.0, min(15.0, gap_today))
+
     cal = _get_cal(attr, game_year, ovr)
 
-    if attr == "stamina" and not has_data:
+    if not has_data:
         return 0.0
 
-    if has_data and abs(gap_today) >= cal["thresh"]:
+    if abs(gap_today) >= cal["thresh"]:
         delta = gap_today * cal["scale"]
         return max(-cal["max"], min(cal["max"], delta))
-    elif not has_data and abs(gap_today) >= 2.5:
-        delta = gap_today * 0.10
-        return max(-3.0, min(3.0, delta))
-    else:
-        return 0.0
+
+    return 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -676,17 +693,10 @@ def aggregate_player_predictions(attr_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # OVR delta from weighted sum of attribute deltas
-    # Use trained OVR weights (already applied), no arbitrary multiplier
-    grouped["predicted_ovr_delta"] = (grouped["weighted_sum"] * 1.5).clip(-8.0, 8.0)
-
-    # Tier-aware boost near boundaries (small, data-driven)
-    def _tier_boost(ovr):
-        dist = min(abs(ovr - b) for b in _TIER_BOUNDARIES)
-        if dist <= 2:
-            return 0.15 * (2 - dist) / 2
-        return 0.0
-    boost = grouped["current_ovr"].apply(_tier_boost)
-    grouped["predicted_ovr_delta"] = (grouped["predicted_ovr_delta"] * (1.0 + boost)).clip(-8.0, 8.0)
+    # The weights are already normalized per position, so weighted_sum is
+    # directly the predicted OVR delta. No arbitrary multiplier needed.
+    # Clip to realistic range: SDS rarely changes OVR by more than ±3-4.
+    grouped["predicted_ovr_delta"] = grouped["weighted_sum"].clip(-5.0, 5.0)
 
     # Directional probabilities from calibrated gap→prob mapping
     def _ovr_probs(row):
