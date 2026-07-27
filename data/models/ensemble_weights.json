@@ -1,0 +1,12 @@
+{
+  "hitter": {
+    "w_signal1": 0.5,
+    "w_signal2": 0.3,
+    "w_signal3": 0.2
+  },
+  "pitcher": {
+    "w_signal1": 0.5,
+    "w_signal2": 0.3,
+    "w_signal3": 0.2
+  }
+}

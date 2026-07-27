@@ -58,7 +58,7 @@ HIGHER_IS_BETTER = {
 class GameLogFetcher:
     """Fetches and caches individual game logs from the MLB Stats API."""
 
-    def __init__(self, delay: float = 0.15):
+    def __init__(self, delay: float = 0.1):
         self.delay = delay
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "mlb-show-roster-predictor/1.0"})

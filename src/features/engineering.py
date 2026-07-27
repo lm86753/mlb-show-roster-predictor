@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta
 from functools import lru_cache
 
@@ -8,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from src.config import (
+    CACHE_DIR,
     HITTER_ATTRS,
     MIN_AB_21D,
     MIN_IP_21D,
@@ -279,9 +281,12 @@ def build_feature_row(
     momentum_14d_21d = vel_14d - vel_21d
 
     # Game-log derived momentum (trend, streak, consistency, volatility)
-    momentum_from_games = {}
-    if mlb_id and season:
+    if "momentum" in stat_windows:
+        momentum_from_games = stat_windows["momentum"]
+    elif mlb_id and season:
         momentum_from_games = compute_momentum_features(mlb_id, season, is_hitter)
+    else:
+        momentum_from_games = {}
 
     # Streak: from recent rating history for this attribute
     streak_count = _compute_streak(rating_history)
@@ -567,7 +572,7 @@ def build_live_features(
     primary_window: str = "21d",
     fast: bool = True,
 ) -> pd.DataFrame:
-    from src.ingest.mlb_stats import build_live_stat_windows
+    from src.ingest.mlb_stats import build_live_stat_windows, _load_statcast_cache
 
     Session = init_db()
     client = MLBStatsClient()
@@ -576,8 +581,11 @@ def build_live_features(
     stat_cache: dict[int, dict] = {}
     momentum_cache: dict[int, dict] = {}
 
+    statcast = _load_statcast_cache(season)
+
     # Latest rating lookup
     latest_rating_lookup: dict[tuple[int, str], int] = {}
+    days_since_live_lookup: dict[int, int | None] = {}
     with Session() as session:
         subq = (
             session.query(
@@ -617,51 +625,89 @@ def build_live_features(
         if not cards:
             cards = session.query(CardSnapshot).filter_by(game_year=game_year, series="Live").all()
 
+        # Prefetch days_since_live for all players with MLB IDs
+        all_mlb_ids = [c.mlb_player_id for c in cards if c.mlb_player_id]
+        if all_mlb_ids:
+            dsl_subq = (
+                session.query(
+                    AttributeChange.mlb_player_id,
+                    sqlfunc.max(AttributeChange.update_date).label("max_date"),
+                )
+                .filter(AttributeChange.mlb_player_id.in_(all_mlb_ids))
+                .group_by(AttributeChange.mlb_player_id)
+                .subquery()
+            )
+            dsl_rows = (
+                session.query(AttributeChange.mlb_player_id, AttributeChange.update_date)
+                .join(
+                    dsl_subq,
+                    (AttributeChange.mlb_player_id == dsl_subq.c.mlb_player_id)
+                    & (AttributeChange.update_date == dsl_subq.c.max_date),
+                )
+                .all()
+            )
+            for mlb_id_raw, update_date in dsl_rows:
+                mlb_id = int(mlb_id_raw)
+                if update_date:
+                    try:
+                        last_dt = datetime.strptime(str(update_date), "%Y-%m-%d")
+                        days_since_live_lookup[mlb_id] = (datetime.utcnow() - last_dt).days
+                    except (ValueError, TypeError):
+                        days_since_live_lookup[mlb_id] = None
+                else:
+                    days_since_live_lookup[mlb_id] = None
+
+        total = len(cards)
+        print(f"  Building stat windows for {total} cards...", flush=True)
+        t_sw = time.time()
+
         for card in cards:
-            mlb_id = card.mlb_player_id or client.search_player(card.player_name)
+            mlb_id = card.mlb_player_id
+            is_hitter = bool(card.is_hitter)
+
+            if mlb_id not in stat_cache:
+                cache_path = CACHE_DIR / "live_windows" / f"{mlb_id}_{season}_{'hit' if is_hitter else 'pit'}.json"
+                if cache_path.exists():
+                    try:
+                        stat_cache[mlb_id] = json.loads(cache_path.read_text(encoding="utf-8"))
+                    except (json.JSONDecodeError, OSError):
+                        stat_cache[mlb_id] = {}
+                else:
+                    try:
+                        stat_cache[mlb_id] = build_live_stat_windows(
+                            mlb_id, season, is_hitter, client, fast=fast, statcast=statcast
+                        )
+                    except Exception:
+                        stat_cache[mlb_id] = {w: {} for w in WINDOW_PRIORITY}
+
+        print(f"  Stat windows done in {time.time()-t_sw:.2f}s", flush=True)
+        print(f"  Building feature rows for {total} cards...", flush=True)
+        t_feat = time.time()
+
+        for idx, card in enumerate(cards):
+            if idx % 500 == 0:
+                print(f"  Processing card {idx+1}/{total}...", flush=True)
+
+            mlb_id = card.mlb_player_id
             has_mlb_id = bool(mlb_id)
             if not mlb_id:
                 mlb_id = -(hash(card.card_uuid) % 10**9)
             attrs = json.loads(card.attributes_json or "{}")
             is_hitter = bool(card.is_hitter)
 
-            # Days since last update
-            days_since_live = None
-            if has_mlb_id:
-                last_live = (
-                    session.query(AttributeChange.update_date)
-                    .filter(AttributeChange.mlb_player_id == mlb_id)
-                    .order_by(AttributeChange.update_date.desc())
-                    .first()
-                )
-                if last_live and last_live.update_date:
-                    try:
-                        last_dt = datetime.strptime(str(last_live.update_date), "%Y-%m-%d")
-                        days_since_live = (datetime.utcnow() - last_dt).days
-                    except (ValueError, TypeError):
-                        days_since_live = None
+            days_since_live = days_since_live_lookup.get(int(mlb_id)) if has_mlb_id else None
 
-            # Stat windows
-            if mlb_id not in stat_cache:
-                if not has_mlb_id:
-                    stat_cache[mlb_id] = {w: {} for w in WINDOW_PRIORITY}
-                elif fast:
-                    stat_cache[mlb_id] = build_live_stat_windows(mlb_id, season, is_hitter, client)
-                else:
-                    as_of = (datetime.utcnow() - timedelta(days=horizon_days)).strftime("%Y-%m-%d")
+            windows = stat_cache.get(mlb_id, {})
+
+            if not fast:
+                if mlb_id not in momentum_cache and has_mlb_id:
                     try:
-                        stat_cache[mlb_id] = build_player_stat_windows(mlb_id, as_of, is_hitter, season)
+                        momentum_cache[mlb_id] = compute_momentum_features(mlb_id, season, is_hitter)
                     except Exception:
-                        stat_cache[mlb_id] = {w: {} for w in WINDOW_PRIORITY}
-            windows = stat_cache[mlb_id]
-
-            # Pre-compute momentum features once per player
-            if mlb_id not in momentum_cache and has_mlb_id:
-                try:
-                    momentum_cache[mlb_id] = compute_momentum_features(mlb_id, season, is_hitter)
-                except Exception:
-                    momentum_cache[mlb_id] = {}
-            momentum_feats = momentum_cache.get(mlb_id, {})
+                        momentum_cache[mlb_id] = {}
+                momentum_feats = momentum_cache.get(mlb_id, {})
+            else:
+                momentum_feats = {}
             windows_with_momentum = dict(windows)
             windows_with_momentum["momentum"] = momentum_feats
 
@@ -683,7 +729,7 @@ def build_live_features(
                     card.rarity or "Silver",
                     card.position or "",
                     is_hitter,
-                    windows,
+                    windows_with_momentum,
                     primary_window,
                     days_since_last_update=days_since_live,
                     player_name=card.player_name or "",
@@ -703,6 +749,8 @@ def build_live_features(
                     }
                 )
                 rows.append(feats)
+
+        print(f"  Feature rows done in {time.time()-t_feat:.2f}s", flush=True)
 
     return pd.DataFrame(rows)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -392,7 +393,7 @@ def refit_coefficients(training_df, min_samples: int = 20) -> dict:
         if len(np.unique(y)) < 3:
             continue
 
-        model = Ridge(alpha=1.0)
+        model = Ridge(alpha=0.01)
         model.fit(X, y)
 
         # Build coefficient dict in the same format as DEFAULT_COEFFICIENTS
@@ -457,6 +458,7 @@ def load_coefficients(path: Path | None = None) -> dict | None:
         return None
 
 
+@lru_cache(maxsize=1)
 def _load_active_coefficients() -> dict:
     """Load refitted coefficients if available, otherwise fall back to defaults.
 

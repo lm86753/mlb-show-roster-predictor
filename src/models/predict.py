@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 
-from src.config import DB_PATH, MODELS_DIR, HITTER_ATTRS, PITCHER_ATTRS
+from src.config import DB_PATH, MODELS_DIR, QS_TIERS, HITTER_ATTRS, PITCHER_ATTRS
 from src.db import AttributeChange, PlayerStatWindow, Prediction, init_db, dumps
 from src.formulas.ratings import project_attribute, LEAGUE_AVG
 from src.models.registry import normalize_attr_name, attrs_for_position, stat_group
@@ -186,39 +186,36 @@ def _ovr_weight(attr: str, is_hitter: bool) -> float:
 
 
 # ── Default calibration fallback ───────────────────────────────────────────
-# Conservative values to prevent extreme predictions:
-# - threshold: minimum |gap| before predicting any change (higher = fewer changes)
-# - scale: what fraction of the gap to apply as delta (lower = smaller changes)
+# Calibration maps: |gap| → predicted delta
+# - thresh: minimum |gap| before predicting any change (noise threshold)
+# - scale: what fraction of gap to apply as delta (historically SDS changes
+#   ~15-20% of the stat-to-card gap per update)
 # - max: maximum absolute delta per attribute
-# The old values (thresh=2, scale=0.20) produced -6 to -8 OVR deltas for
-# high-OVR players because formulas systematically project 50-76 vs 90+ card.
-_DEFAULT_CAL = {"thresh": 5.0, "scale": 0.08, "max": 3.0}
-
 _ATTR_DEFAULTS = {
-    "contact_left":          {"thresh": 5.0, "scale": 0.08, "max": 3.0},
-    "contact_right":         {"thresh": 5.0, "scale": 0.08, "max": 3.0},
-    "power_left":            {"thresh": 5.0, "scale": 0.08, "max": 3.0},
-    "power_right":           {"thresh": 5.0, "scale": 0.08, "max": 3.0},
-    "plate_vision":          {"thresh": 4.0, "scale": 0.10, "max": 4.0},
-    "plate_discipline":      {"thresh": 5.0, "scale": 0.08, "max": 3.0},
-    "batting_clutch":        {"thresh": 5.0, "scale": 0.08, "max": 3.0},
-    "speed":                 {"thresh": 5.0, "scale": 0.08, "max": 3.0},
-    "fielding_ability":      {"thresh": 6.0, "scale": 0.05, "max": 2.0},
-    "arm_strength":          {"thresh": 6.0, "scale": 0.05, "max": 2.0},
-    "arm_accuracy":          {"thresh": 6.0, "scale": 0.05, "max": 2.0},
-    "reaction_time":         {"thresh": 6.0, "scale": 0.05, "max": 2.0},
-    "pitch_velocity":        {"thresh": 4.0, "scale": 0.10, "max": 4.0},
-    "pitch_control":         {"thresh": 5.0, "scale": 0.08, "max": 3.0},
-    "pitch_movement":        {"thresh": 5.0, "scale": 0.08, "max": 3.0},
-    "pitching_clutch":       {"thresh": 5.0, "scale": 0.08, "max": 3.0},
-    "stamina":               {"thresh": 6.0, "scale": 0.05, "max": 2.0},
-    "k_per_9":               {"thresh": 4.0, "scale": 0.10, "max": 4.0},
-    "hr_per_9":              {"thresh": 4.0, "scale": 0.10, "max": 4.0},
-    "k_per_9_r":             {"thresh": 4.0, "scale": 0.10, "max": 4.0},
-    "k_per_9_l":             {"thresh": 4.0, "scale": 0.10, "max": 4.0},
-    "h_per_9_r":             {"thresh": 5.0, "scale": 0.08, "max": 3.0},
-    "h_per_9":               {"thresh": 5.0, "scale": 0.08, "max": 3.0},
-    "bb_per_9":              {"thresh": 4.0, "scale": 0.10, "max": 4.0},
+    "contact_left":          {"thresh": 3.0, "scale": 0.18, "max": 8.0},
+    "contact_right":         {"thresh": 3.0, "scale": 0.18, "max": 8.0},
+    "power_left":            {"thresh": 3.0, "scale": 0.18, "max": 8.0},
+    "power_right":           {"thresh": 3.0, "scale": 0.18, "max": 8.0},
+    "plate_vision":          {"thresh": 3.0, "scale": 0.18, "max": 8.0},
+    "plate_discipline":      {"thresh": 3.0, "scale": 0.20, "max": 8.0},
+    "batting_clutch":        {"thresh": 3.0, "scale": 0.18, "max": 8.0},
+    "speed":                 {"thresh": 4.0, "scale": 0.15, "max": 6.0},
+    "fielding_ability":      {"thresh": 4.0, "scale": 0.12, "max": 5.0},
+    "arm_strength":          {"thresh": 4.0, "scale": 0.12, "max": 5.0},
+    "arm_accuracy":          {"thresh": 4.0, "scale": 0.12, "max": 5.0},
+    "reaction_time":         {"thresh": 4.0, "scale": 0.12, "max": 5.0},
+    "pitch_velocity":        {"thresh": 3.0, "scale": 0.18, "max": 8.0},
+    "pitch_control":         {"thresh": 3.0, "scale": 0.18, "max": 8.0},
+    "pitch_movement":        {"thresh": 3.0, "scale": 0.18, "max": 8.0},
+    "pitching_clutch":       {"thresh": 3.0, "scale": 0.18, "max": 8.0},
+    "stamina":               {"thresh": 5.0, "scale": 0.10, "max": 5.0},
+    "k_per_9":               {"thresh": 3.0, "scale": 0.18, "max": 8.0},
+    "hr_per_9":              {"thresh": 3.0, "scale": 0.18, "max": 8.0},
+    "k_per_9_r":             {"thresh": 3.0, "scale": 0.18, "max": 8.0},
+    "k_per_9_l":             {"thresh": 3.0, "scale": 0.18, "max": 8.0},
+    "h_per_9_r":             {"thresh": 3.0, "scale": 0.18, "max": 8.0},
+    "h_per_9":               {"thresh": 3.0, "scale": 0.18, "max": 8.0},
+    "bb_per_9":              {"thresh": 3.0, "scale": 0.18, "max": 8.0},
 }
 
 
@@ -227,22 +224,15 @@ def _get_cal(attr: str, game_year: int = 26, ovr: int = 75) -> dict:
     year_cal = cal.get(str(game_year), cal.get(game_year, {}))
     if attr in year_cal:
         c = dict(year_cal[attr])
-        # Clamp old aggressive calibration to conservative defaults
-        d = _ATTR_DEFAULTS.get(attr, _DEFAULT_CAL)
+        d = _ATTR_DEFAULTS.get(attr, {"thresh": 3.0, "scale": 0.15, "max": 5.0})
         c["thresh"] = max(c["thresh"], d["thresh"])
         c["scale"] = min(c["scale"], d["scale"])
         c["max"] = min(c["max"], d["max"])
     elif attr in _ATTR_DEFAULTS:
         c = _ATTR_DEFAULTS[attr]
     else:
-        c = _DEFAULT_CAL
-    # Scale threshold by OVR: elite cards need larger gap to change
-    thresh_factor = 1.0 + max(0, (ovr - 75) / 99) * 0.3
-    return {
-        "thresh": c["thresh"] * thresh_factor,
-        "scale": c["scale"],
-        "max": c["max"],
-    }
+        c = {"thresh": 3.0, "scale": 0.15, "max": 5.0}
+    return {"thresh": c["thresh"], "scale": c["scale"], "max": c["max"]}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -265,6 +255,7 @@ def _get_historical_deltas() -> dict[str, list[float]]:
     return dict(deltas)
 
 
+@lru_cache(maxsize=4096)
 def _get_player_trend(mlb_id: int, attr: str) -> float:
     Session = init_db()
     with Session() as session:
@@ -328,14 +319,16 @@ def signal1_predict(
     windows: dict,
     has_data: bool,
 ) -> float:
-    """Signal 1: calibrated multi-window gap projection.
+    """Signal 1: uses absolute gap_today (blended multi-window projection).
 
-    Always projects as if the update were today — uses blended gap_today
-    from all available windows (35% 7d, 30% 14d, 20% 21d, 15% YTD).
+    gap = projected_rating - current_card_rating
+      positive → stats project HIGHER than card → predict upgrade
+      negative → stats project LOWER than card → predict downgrade
 
-    Gap is clamped to ±15 before scale to prevent formula's systematic
-    underprediction of elite cards (formulas produce 50-76 for league avg
-    stats, while top cards are 90+) from generating crazy deltas.
+    The multi-window blend (7d/14d/21d/ytd weighted) smooths out short-term
+    noise while keeping the full signal. No relative-gap subtraction because
+    SDS upgrades players who outperform their rating regardless of whether
+    the outperformance is recent or sustained.
     """
     attr = normalize_attr_name(attr)
     rating = float(row.get("rating_before", row.get("current_rating", 60)))
@@ -343,16 +336,9 @@ def signal1_predict(
     is_hitter = bool(row.get("is_hitter", True))
     game_year = int(row.get("game_year", 26))
 
-    # No stat data and attr has no real formula → can't predict
-    if not has_data and attr in ("fielding_ability", "arm_strength", "arm_accuracy",
-                                  "reaction_time", "stamina", "speed",
-                                  "bunting_ability", "drag_bunting_ability",
-                                  "blocking", "baserunning_aggression",
-                                  "baserunning_ability", "hitting_durability",
-                                  "fielding_durability"):
+    if not has_data:
         return 0.0
 
-    # Compute multi-window projections → gaps
     projs = compute_window_projections(attr, windows, is_hitter)
     gaps = compute_window_gaps(projs, int(rating))
 
@@ -360,14 +346,7 @@ def signal1_predict(
     if gap_today == 0.0 and abs(gaps.get("gap_21d", 0.0)) > 0:
         gap_today = gaps["gap_21d"]
 
-    # Clamp extreme gaps: formulas systematically underrate elite cards,
-    # so a gap of -40 doesn't mean a -8 delta is coming
-    gap_today = max(-15.0, min(15.0, gap_today))
-
     cal = _get_cal(attr, game_year, ovr)
-
-    if not has_data:
-        return 0.0
 
     if abs(gap_today) >= cal["thresh"]:
         delta = gap_today * cal["scale"]
@@ -397,8 +376,8 @@ def signal2_predict(
         return 0.0
 
     try:
-        X = np.array([row.get(f, 0.0) for f in REGRESSION_FEATURES]).reshape(1, -1)
-        X = np.nan_to_num(X, nan=0.0)
+        X = pd.DataFrame([[row.get(f, 0.0) for f in REGRESSION_FEATURES]], columns=REGRESSION_FEATURES)
+        X = X.fillna(0.0)
         pred = float(model.predict(X)[0])
         return max(-8.0, min(8.0, pred))
     except Exception:
@@ -408,6 +387,9 @@ def signal2_predict(
 # ═══════════════════════════════════════════════════════════════════════════
 #  Signal 3: Historical analog matching (k-NN weighted outcome)
 # ═══════════════════════════════════════════════════════════════════════════
+
+_ANALOG_CACHE: dict[tuple, float] = {}
+
 
 def signal3_predict(
     attr: str,
@@ -437,26 +419,39 @@ def signal3_predict(
         if pd.isna(val) or val is None:
             val = 0.0
         feat_vals.append(float(val))
-    x = np.array(feat_vals, dtype=np.float64)
-    x_norm = (x - mean) / std
 
-    # Cosine similarity
-    sims = cosine_similarity(x_norm.reshape(1, -1), vectors)[0]
+    mlb_id = row.get("mlb_player_id")
+    is_hitter = bool(row.get("is_hitter", True))
+    cache_key = (
+        int(mlb_id) if mlb_id is not None and pd.notna(mlb_id) else None,
+        is_hitter,
+        tuple(round(v, 6) for v in feat_vals),
+    )
+    if cache_key in _ANALOG_CACHE:
+        return _ANALOG_CACHE[cache_key]
 
-    # Top-k
-    k = min(k, len(sims))
-    top_idx = np.argsort(sims)[::-1][:k]
-    top_sims = sims[top_idx]
-    top_outcomes = outcomes[top_idx]
+    try:
+        x = np.array(feat_vals, dtype=np.float64)
+        x_norm = (x - mean) / std
 
-    # Weight by similarity (only positive similarities)
-    weights = np.maximum(top_sims, 0.0)
-    total_w = weights.sum()
-    if total_w < 0.01:
+        sims = cosine_similarity(x_norm.reshape(1, -1), vectors)[0]
+
+        k = min(k, len(sims))
+        top_idx = np.argsort(sims)[::-1][:k]
+        top_sims = sims[top_idx]
+        top_outcomes = outcomes[top_idx]
+
+        weights = np.maximum(top_sims, 0.0)
+        total_w = weights.sum()
+        if total_w < 0.01:
+            result = 0.0
+        else:
+            result = max(-8.0, min(8.0, float(np.dot(weights, top_outcomes) / total_w)))
+
+        _ANALOG_CACHE[cache_key] = result
+        return result
+    except Exception:
         return 0.0
-
-    weighted_avg = float(np.dot(weights, top_outcomes) / total_w)
-    return max(-8.0, min(8.0, weighted_avg))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -551,15 +546,19 @@ def predict_attr_delta(
 
     predicted = s1 * w["w_signal1"] + s2 * w["w_signal2"] + s3 * w["w_signal3"]
 
+    # Apply calibration cap to ensemble output.
+    # All 3 signals must respect the same per-attribute bounds.
+    cal = _get_cal(attr, game_year, ovr)
+    predicted = max(-cal["max"], min(cal["max"], predicted))
+
     # Simple trend overlay (from old system, still useful)
     if mlb_id and abs(predicted) > 0.5:
         trend = _get_player_trend(mlb_id, attr)
         if abs(trend) > 0.5 and np.sign(trend) == np.sign(predicted):
             predicted += trend * 0.15
-            cal = _get_cal(attr, game_year, ovr)
             predicted = max(-cal["max"], min(cal["max"], predicted))
 
-    # Clip
+    # Hard safety clip
     predicted = max(-8.0, min(8.0, predicted))
 
     # Change probability: logistic from gap_today
@@ -634,15 +633,9 @@ def predict_attributes(df: pd.DataFrame) -> pd.DataFrame:
 
 _TIER_BOUNDARIES = [65, 75, 85, 90, 95]
 
-_QS_TIERS = [
-    (0, 25), (65, 100), (75, 300), (80, 600),
-    (85, 1000), (90, 5000), (92, 10000),
-    (94, 25000), (95, 50000), (97, 100000),
-]
-
 
 def _qs_value(ovr: int) -> int:
-    return max((v for k, v in _QS_TIERS if ovr >= k), default=0)
+    return max((v for k, v in QS_TIERS if ovr >= k), default=0)
 
 
 def _calibrated_prob(gap_today: float, direction: str = "up") -> float:
@@ -673,7 +666,7 @@ def aggregate_player_predictions(attr_df: pd.DataFrame) -> pd.DataFrame:
     attr_df["abs_delta"] = attr_df["predicted_delta"].abs()
 
     grouped = (
-        attr_df.groupby(["card_uuid", "player_name", "mlb_player_id", "current_ovr", "current_rarity", "is_hitter"])
+        attr_df.groupby(["card_uuid", "player_name", "mlb_player_id", "current_ovr", "current_rarity", "is_hitter"], dropna=False)
         .agg(
             n_attrs=("predicted_delta", "count"),
             weighted_sum=("weighted_delta", "sum"),
@@ -713,8 +706,12 @@ def aggregate_player_predictions(attr_df: pd.DataFrame) -> pd.DataFrame:
         return pd.Series({"upgrade_probability": p_up, "downgrade_probability": p_down})
 
     probs = grouped.apply(_ovr_probs, axis=1)
-    grouped["upgrade_probability"] = probs["upgrade_probability"]
-    grouped["downgrade_probability"] = probs["downgrade_probability"]
+    if "upgrade_probability" in probs.columns:
+        grouped["upgrade_probability"] = probs["upgrade_probability"]
+        grouped["downgrade_probability"] = probs["downgrade_probability"]
+    else:
+        grouped["upgrade_probability"] = 0.5
+        grouped["downgrade_probability"] = 0.5
 
     # Tier-jump probability
     def _tier_jump(row):
@@ -742,49 +739,42 @@ def aggregate_player_predictions(attr_df: pd.DataFrame) -> pd.DataFrame:
     pct_up_weighted = grouped["weighted_up_sum"].clip(lower=0) / safe_total
     grouped["direction_consensus"] = np.where(no_movement, 0.0, (2 * pct_up_weighted - 1).clip(-1, 1))
 
-    # ── Market-simulated investment score ──────────────────────────────
-    # Expected Value = P(up) * profit_up + P(down) * profit_down + P(hold) * 0
-    # profit_up = QS(new_ovr) - QS(current_ovr)
-    # profit_down = QS(new_ovr) - QS(current_ovr) (negative = loss)
+    # ── Investment score (normalised -100 to +100 scale) ────────────────
+    # Uses a simplified stub QS table for reference only. The actual score
+    # is a compressed confidence-weighted signal, not raw stub profit.
     def _expected_value(row):
-        ovr = row["current_ovr"]
         delta = row["predicted_ovr_delta"]
         p_up = row["upgrade_probability"]
         p_down = row["downgrade_probability"]
+        tier_jump = row["tier_jump_probability"]
 
-        # Project new OVR
-        new_ovr_up = min(99, max(0, ovr + int(round(abs(delta)))))
-        new_ovr_down = min(99, max(0, ovr - int(round(abs(delta)))))
+        # Direction strength: -1 (strong down) to +1 (strong up)
+        direction = np.sign(delta) * min(1.0, abs(delta) / 3.0)
 
+        # Confidence: net directional probability
+        confidence = p_up - p_down  # -1 to +1
+
+        # Tier-jump bonus: +-20 for crossing a tier boundary
+        tier_bonus = np.sign(delta) * tier_jump * 20.0 if abs(delta) > 0.5 else 0.0
+
+        # Composite score -100 to +100
+        score = (direction * 50 + confidence * 30 + tier_bonus)
+        score = max(-100, min(100, score))
+
+        # Stub reference for info
+        ovr = row["current_ovr"]
         cur_qs = _qs_value(ovr)
-        qs_up = _qs_value(new_ovr_up)
-        qs_down = _qs_value(new_ovr_down)
-
-        profit_up = qs_up - cur_qs
-        profit_down = qs_down - cur_qs
-
-        ev = p_up * profit_up + p_down * profit_down
-
-        # Apply stack limit (max 20)
-        total_ev = ev * 20
-
-        # ROI if we buy at current QS
-        if cur_qs > 0:
-            roi = (ev / cur_qs) * 100
-        else:
-            roi = 0.0
-
-        # Final score: blend EV and tier-jump potential
-        score = ev + row["tier_jump_probability"] * 500
+        stub_ev = (p_up - p_down) * cur_qs
+        stub_ev = max(-cur_qs, min(cur_qs, stub_ev))
 
         return pd.Series({
             "investment_score": round(score, 0),
-            "expected_value_per_card": round(ev, 0),
-            "total_ev_20_stack": round(total_ev, 0),
-            "roi_pct": round(roi, 1),
+            "expected_value_per_card": round(stub_ev, 0),
+            "total_ev_20_stack": round(stub_ev * 20, 0),
+            "roi_pct": round((delta / ovr) * 100, 1) if ovr else 0,
             "current_qs": cur_qs,
-            "projected_qs_up": qs_up,
-            "projected_qs_down": qs_down,
+            "projected_qs_up": cur_qs + int(round(max(0, stub_ev))),
+            "projected_qs_down": cur_qs - int(round(max(0, -stub_ev))),
         })
 
     ev_metrics = grouped.apply(_expected_value, axis=1)

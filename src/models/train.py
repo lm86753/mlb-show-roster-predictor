@@ -218,76 +218,24 @@ def train_ensemble_weights(
     df: pd.DataFrame,
     signal1_preds: np.ndarray | None = None,
 ) -> dict:
-    """Learn optimal blend weights for the 3 signals via Ridge on validation.
+    """Return fixed ensemble blend weights.
 
-    When signal1_preds is not provided (e.g. during initial fit), we
-    simulate Signal 1 as gap_today * median_scale (from calibration).
+    The 3-signal ensemble uses fixed weights based on observed performance:
+      Signal 1 (gap projection): primary signal, most reliable → 50%
+      Signal 2 (delta regression): complementary, noisy → 30%
+      Signal 3 (analog matching): contextual, sparse → 20%
 
-    Weights are per (attribute_group) so that different attributes may
-    weight signals differently.
+    Learned weights from Ridge are unreliable because:
+      - Signal 2 overfits when trained/predicted on same fold
+      - Data noise makes Ridge weights unstable across folds
     """
-    df = df.copy()
-    df["is_hitter_flag"] = df["is_hitter"].astype(int)
-
-    group_weights = {}
-    for label, is_hitter in [("hitter", 1), ("pitcher", 0)]:
-        sub = df[df["is_hitter_flag"] == is_hitter]
-        if len(sub) < 50:
-            group_weights[label] = {"w_signal1": 0.40, "w_signal2": 0.40, "w_signal3": 0.20}
-            continue
-
-        # Simulate Signal 1: gap_today * calibration scale
-        gap_today = sub["gap_today"].fillna(0).values
-        gap_7d = sub["gap_7d"].fillna(0).values 
-
-        # Signal 1 uses a blended gap: 0.6 * gap_today + 0.4 * clip(gap_7d, -3, 3)
-        s1 = 0.6 * gap_today + 0.4 * np.clip(gap_7d, -3, 3)
-        # Apply typical calibration shrinkage
-        s1 = s1 * 0.20
-        s1 = np.clip(s1, -5, 5)
-
-        # Simulate Signal 2: use regression features to predict
-        X_feats = sub[REGRESSION_FEATURES].fillna(0).values
-        if LGBMRegressor is not None:
-            try:
-                reg = LGBMRegressor(n_estimators=100, max_depth=3, learning_rate=0.05, verbose=-1)
-                reg.fit(X_feats, sub["delta"].fillna(0).values)
-                s2 = reg.predict(X_feats)
-            except Exception:
-                s2 = np.zeros(len(sub))
-        else:
-            s2 = np.zeros(len(sub))
-
-        # Simulate Signal 3: simple gap-based analog (gap_today similarity)
-        s3 = np.zeros(len(sub))
-
-        # Blend with Ridge: predict delta from [s1, s2, s3]
-        X_blend = np.column_stack([s1, s2, s3])
-        y = sub["delta"].fillna(0).values
-
-        try:
-            ridge = Ridge(alpha=5.0, positive=True)
-            ridge.fit(X_blend, y)
-            coefs = ridge.coef_
-            total = coefs.sum()
-            if total > 0:
-                coefs = coefs / total
-            group_weights[label] = {
-                "w_signal1": float(coefs[0]),
-                "w_signal2": float(coefs[1]),
-                "w_signal3": float(coefs[2]),
-            }
-        except Exception:
-            group_weights[label] = {"w_signal1": 0.40, "w_signal2": 0.40, "w_signal3": 0.20}
-
-        logger.info("Ensemble weights (%s): s1=%.3f s2=%.3f s3=%.3f",
-                     label,
-                     group_weights[label]["w_signal1"],
-                     group_weights[label]["w_signal2"],
-                     group_weights[label]["w_signal3"])
-
+    group_weights = {
+        "hitter": {"w_signal1": 0.50, "w_signal2": 0.30, "w_signal3": 0.20},
+        "pitcher": {"w_signal1": 0.50, "w_signal2": 0.30, "w_signal3": 0.20},
+    }
     path = MODELS_DIR / "ensemble_weights.json"
     path.write_text(json.dumps(group_weights, indent=2), encoding="utf-8")
+    logger.info("Ensemble weights: s1=0.50 s2=0.30 s3=0.20 (fixed)")
     return group_weights
 
 
@@ -302,7 +250,9 @@ def calibrate_confidence_intervals(df: pd.DataFrame) -> dict:
     """
     df = df.copy()
     df["abs_gap"] = df["gap_today"].abs()
-    df["error"] = (df["gap_today"] * 0.20 - df["delta"]).abs()
+    # Predicted delta ≈ gap * 0.15, so error = |predicted - actual|
+    predicted = np.clip(df["gap_today"].fillna(0), -20, 20) * 0.15
+    df["error"] = (predicted - df["delta"].fillna(0)).abs()
 
     buckets = []
     boundaries = [0, 1, 2, 3, 4, 6, 8, 12, 99]
@@ -491,12 +441,22 @@ def save_metrics(metrics: dict, fold: str = "test") -> None:
     Session = init_db()
     with Session() as session:
         for model_name, model_metrics in metrics.items():
-            for metric_name, value in model_metrics.items():
+            if isinstance(model_metrics, dict):
+                for metric_name, value in model_metrics.items():
+                    session.add(
+                        ModelMetrics(
+                            model_name=model_name,
+                            metric_name=metric_name,
+                            metric_value=float(value),
+                            fold=fold,
+                        )
+                    )
+            else:
                 session.add(
                     ModelMetrics(
-                        model_name=model_name,
-                        metric_name=metric_name,
-                        metric_value=float(value),
+                        model_name="ensemble",
+                        metric_name=model_name,
+                        metric_value=float(model_metrics),
                         fold=fold,
                     )
                 )

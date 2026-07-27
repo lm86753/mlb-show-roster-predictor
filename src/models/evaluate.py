@@ -171,7 +171,7 @@ def evaluate_fold(train: pd.DataFrame, test: pd.DataFrame) -> dict:
         )
         .reset_index()
     )
-    player_pred["pred_ovr_delta"] = (player_pred["pred_delta_sum"] / player_pred["n_attrs"].clip(lower=1) * 1.5).clip(-8.0, 8.0)
+    player_pred["pred_ovr_delta"] = (player_pred["pred_delta_sum"] / player_pred["n_attrs"].clip(lower=1)).clip(-5.0, 5.0)
     if len(player_pred) > 5:
         metrics["ovr_delta_mae"] = float(
             mean_absolute_error(player_pred["ovr_delta"], player_pred["pred_ovr_delta"])

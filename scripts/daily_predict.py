@@ -16,10 +16,12 @@ from src.models.predict import run_predictions
 def main():
     parser = argparse.ArgumentParser(description="Run daily roster update predictions (3-signal ensemble)")
     parser.add_argument("--game-year", type=int, default=26)
-    parser.add_argument("--horizons", type=int, nargs="+", default=[7, 3, 1])
+    parser.add_argument("--horizons", type=int, nargs="+", default=[1], help="Prediction horizons (default: [1] for dashboard)")
     parser.add_argument("--skip-cards", action="store_true")
     parser.add_argument("--skip-link", action="store_true")
     parser.add_argument("--link-limit", type=int, default=None)
+    parser.add_argument("--fast", action="store_true", help="Use fast stat windows (skip game-log fetch)")
+    parser.add_argument("--skip-predictions", action="store_true", help="Skip prediction pipeline, just launch dashboard")
     args = parser.parse_args()
 
     if not args.skip_cards:
@@ -35,7 +37,7 @@ def main():
     results = {}
     for horizon in args.horizons:
         print(f"Scoring T-{horizon} horizon with 3-signal ensemble...")
-        live_df = build_live_features(game_year=args.game_year, horizon_days=horizon)
+        live_df = build_live_features(game_year=args.game_year, horizon_days=horizon, fast=args.fast)
         preds = run_predictions(live_df, horizon_days=horizon, persist=True)
         top_cols = ["player_name", "current_ovr", "predicted_ovr_delta",
                      "upgrade_probability", "investment_score",

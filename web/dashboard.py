@@ -330,7 +330,7 @@ def render_detail_expander(player_row, df_filtered):
         st.markdown(f"**Tier Jump Probability:** {tier_jump_prob*100:.1f}%")
 
     if not pd.isna(delta):
-        qs_tiers = [(0, 25), (65, 100), (75, 300), (85, 1000), (90, 5000), (95, 10000)]
+        qs_tiers = [(0, 25), (65, 100), (75, 300), (80, 600), (85, 1000), (90, 5000), (92, 10000), (94, 25000), (95, 50000), (97, 100000)]
         ovr = player_row.get('current_ovr', 0)
         cur_qs = max((v for k, v in qs_tiers if ovr >= k), default=0)
         new_ovr = max(0, min(99, int(ovr + round(delta))))

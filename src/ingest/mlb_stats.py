@@ -15,7 +15,7 @@ from src.formulas.ratings import LEAGUE_AVG
 
 
 class MLBStatsClient:
-    def __init__(self, delay: float = 0.2):
+    def __init__(self, delay: float = 0.1):
         self.delay = delay
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "mlb-show-roster-predictor/1.0"})
@@ -301,26 +301,25 @@ def _merge_statcast(
     mlb_id: int,
     is_hitter: bool,
     season: int,
+    statcast: dict | None = None,
 ) -> dict[str, dict]:
     """Enrich stat windows with Statcast data (fb_velo, exit_velo, sprint_speed)."""
-    sc = _load_statcast_cache(season)
+    if statcast is None:
+        statcast = _load_statcast_cache(season)
     sid = str(mlb_id)
 
     for window_key in list(windows.keys()):
         w = windows[window_key]
-        # Pitcher: add fb_velo from four-seam avg speed
-        if not is_hitter and sid in sc.get("pitchers", {}):
-            fb = sc["pitchers"][sid].get("fb_velo")
+        if not is_hitter and sid in statcast.get("pitchers", {}):
+            fb = statcast["pitchers"][sid].get("fb_velo")
             if fb is not None and fb > 0:
                 w["fb_velo"] = fb
-        # Batter: add exit_velo from avg hit speed
-        if is_hitter and sid in sc.get("batters", {}):
-            ev = sc["batters"][sid].get("exit_velo")
+        if is_hitter and sid in statcast.get("batters", {}):
+            ev = statcast["batters"][sid].get("exit_velo")
             if ev is not None and ev > 0:
                 w["exit_velo"] = ev
-        # Both: add sprint_speed
-        if sid in sc.get("sprint", {}):
-            sp = sc["sprint"][sid].get("sprint_speed")
+        if sid in statcast.get("sprint", {}):
+            sp = statcast["sprint"][sid].get("sprint_speed")
             if sp is not None and sp > 0:
                 w["sprint_speed"] = sp
 
@@ -332,13 +331,13 @@ def build_live_stat_windows(
     season: int,
     is_hitter: bool,
     client: MLBStatsClient | None = None,
+    fast: bool = False,
+    statcast: dict | None = None,
 ) -> dict[str, dict]:
-    """Actual rolling 5-day and 21-day windows from game log data (cached).
+    """Rolling stat windows from game log data (cached).
 
-    Computes real 5-day and 21-day rolling windows from the game log
-    instead of duplicating season stats across all windows.
-    Falls back to season-stats-based windows only when no game log data
-    exists for the player.
+    In ``fast`` mode, skips the game-log fetch and falls back to current-year
+    season stats for all windows. This cuts API calls from ~4/player to ~1/player.
     """
     from datetime import datetime, timedelta
 
@@ -350,22 +349,32 @@ def build_live_stat_windows(
     client = client or MLBStatsClient()
     group = "hitting" if is_hitter else "pitching"
 
-    # Use yesterday's date as the end of the live window
+    if fast:
+        ytd_stats = client.get_season_hitting_stats(mlb_player_id, season) if is_hitter else client.get_season_pitching_stats(mlb_player_id, season)
+        season_window = _season_stats_to_window(ytd_stats, is_hitter)
+        windows = {
+            "7d": season_window,
+            "14d": season_window,
+            "21d": season_window,
+            "ytd": season_window,
+            "3yr": season_window,
+        }
+        windows = _merge_statcast(windows, mlb_player_id, is_hitter, season, statcast=statcast)
+        cache_path.write_text(json.dumps(windows), encoding="utf-8")
+        return windows
+
     end_date = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # Attempt game-log-based rolling windows
     try:
         game_log_windows = get_game_log_stats(mlb_player_id, season, group, end_date)
     except Exception:
         game_log_windows = {"5d": {"games": 0}, "21d": {"games": 0}, "ytd": {"games": 0}}
 
-    # Determine which windows actually have games logged
     has_7d = game_log_windows.get("7d", {}).get("games", 0) > 0
     has_14d = game_log_windows.get("14d", {}).get("games", 0) > 0
     has_21d = game_log_windows.get("21d", {}).get("games", 0) > 0
     has_ytd = game_log_windows.get("ytd", {}).get("games", 0) > 0
 
-    # Pre-compute season stat windows as fallback
     if is_hitter:
         ytd_stats = client.get_season_hitting_stats(mlb_player_id, season)
         yr_stats = [client.get_season_hitting_stats(mlb_player_id, yr) for yr in range(season - 2, season + 1)]
@@ -376,7 +385,6 @@ def build_live_stat_windows(
     season_window = _season_stats_to_window(ytd_stats, is_hitter)
     three_yr = _blend_three_year({str(season - 2 + i): s for i, s in enumerate(yr_stats) if s}, is_hitter)
 
-    # Build windows: prefer game-log rolling data, fall back to season stats
     window_7d = game_log_windows.get("7d", season_window) if has_7d else season_window
     window_14d = game_log_windows.get("14d", season_window) if has_14d else season_window
     window_21d = game_log_windows.get("21d", season_window) if has_21d else season_window
@@ -389,7 +397,7 @@ def build_live_stat_windows(
         "ytd": window_ytd,
         "3yr": three_yr or season_window,
     }
-    windows = _merge_statcast(windows, mlb_player_id, is_hitter, season)
+    windows = _merge_statcast(windows, mlb_player_id, is_hitter, season, statcast=statcast)
     cache_path.write_text(json.dumps(windows), encoding="utf-8")
     return windows
 
@@ -399,6 +407,7 @@ def build_player_stat_windows(
     as_of_date: str,
     is_hitter: bool,
     season: int | None = None,
+    statcast: dict | None = None,
 ) -> dict[str, dict]:
     client = MLBStatsClient()
     season = season or int(as_of_date[:4])
@@ -406,7 +415,6 @@ def build_player_stat_windows(
 
     windows = client.get_game_log_stats(mlb_player_id, season, group, as_of_date)
 
-    # 3-year baseline from season stats
     three_yr = {}
     for yr in range(season - 2, season + 1):
         if is_hitter:
@@ -416,7 +424,7 @@ def build_player_stat_windows(
         if s:
             three_yr[str(yr)] = s
     windows["3yr"] = _blend_three_year(three_yr, is_hitter)
-    windows = _merge_statcast(windows, mlb_player_id, is_hitter, season)
+    windows = _merge_statcast(windows, mlb_player_id, is_hitter, season, statcast=statcast)
     return windows
 
 

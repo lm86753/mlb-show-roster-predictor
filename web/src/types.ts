@@ -91,7 +91,8 @@ export interface Filters {
 }
 
 export const QS_TIERS: [number, number][] = [
-  [0, 25], [65, 100], [75, 300], [85, 1000], [90, 5000], [95, 10000],
+  [0, 25], [65, 100], [75, 300], [80, 600], [85, 1000],
+  [90, 5000], [92, 10000], [94, 25000], [95, 50000], [97, 100000],
 ]
 
 export function getTeamColor(team: string | null): string {

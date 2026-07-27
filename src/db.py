@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 from sqlalchemy import (
@@ -145,6 +146,7 @@ def get_engine(db_path: Path | None = None):
     return create_engine(f"sqlite:///{path}", echo=False)
 
 
+@lru_cache(maxsize=8)
 def init_db(db_path: Path | None = None) -> sessionmaker[Session]:
     engine = get_engine(db_path)
     Base.metadata.create_all(engine)
