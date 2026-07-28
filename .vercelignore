@@ -8,7 +8,7 @@ data/processed/
 data/models/
 data/card_images_real/
 data/card_images/
-src/
+/src/
 .venv/
 .venv_new/
 venv/
