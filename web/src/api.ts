@@ -1,6 +1,6 @@
 import type { DashboardResponse, Prediction } from './types'
 
-const API_BASE = '/api'
+const API_BASE = (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '') || '/api'
 
 export async function fetchDashboard(): Promise<DashboardResponse> {
   const res = await fetch(`${API_BASE}/dashboard`)
