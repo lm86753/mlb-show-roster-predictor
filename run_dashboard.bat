@@ -1,29 +1,30 @@
 @echo off
-cd /d C:\Users\luked\mlb-show-roster-predictor
-set PYTHONPATH=
-set PYTHONHOME=
+setlocal enabledelayedexpansion
 
-echo ============================================
-echo MLB The Show 26 Roster Predictor
-echo ============================================
+cd /d "%~dp0"
+
+set "VENV_DIR=.venv_new"
+set "PYTHON=%VENV_DIR%\Scripts\python.exe"
+set "BACKEND_PORT=8000"
+set "DASHBOARD_PORT=8501"
+
+echo Starting MLB Show Roster Predictor...
+
+start "Backend" cmd /c "%PYTHON% -m uvicorn src.api.main:app --host 0.0.0.0 --port %BACKEND_PORT% --log-level warning"
+
+timeout /t 2 /nobreak >nul
+
+start "Dashboard" cmd /c "%PYTHON% -m streamlit run web/dashboard.py --server.port %DASHBOARD_PORT% --browser.gatherUsageStats false"
+
+timeout /t 3 /nobreak >nul
+
+start "" "http://localhost:%DASHBOARD_PORT%"
+
+echo.
+echo Backend:  http://localhost:%BACKEND_PORT%
+echo Dashboard: http://localhost:%DASHBOARD_PORT%
+echo.
+echo Close this window to stop both services.
 echo.
 
-if "%~1"=="--skip-predictions" goto launch_dashboard
-
-echo [1/2] Running prediction pipeline (this takes ~2-3 minutes)...
-echo.
-.venv_new\Scripts\python.exe scripts/daily_predict.py --skip-cards --skip-link --fast
-if errorlevel 1 (
-    echo.
-    echo ERROR: Prediction pipeline failed!
-    pause
-    exit /b 1
-)
-echo.
-echo Predictions complete!
-echo.
-
-:launch_dashboard
-echo [2/2] Launching dashboard on http://localhost:8501
-echo.
-.venv_new\Scripts\python.exe -m streamlit run web/dashboard.py --server.port 8501
+pause

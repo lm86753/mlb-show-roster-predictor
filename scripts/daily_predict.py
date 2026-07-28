@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.features.engineering import build_live_features
 from src.ingest.cards import fetch_live_series_cards, link_cards_to_mlb_ids
-from src.models.predict import run_predictions
+from src.models.predict import PredictionEngine, run_predictions
 
 
 def main():
@@ -34,11 +34,12 @@ def main():
         linked = link_cards_to_mlb_ids(game_year=args.game_year, limit=args.link_limit)
         print(f"Linked {linked} cards to MLB IDs")
 
+    engine = PredictionEngine()
     results = {}
     for horizon in args.horizons:
         print(f"Scoring T-{horizon} horizon with 3-signal ensemble...")
         live_df = build_live_features(game_year=args.game_year, horizon_days=horizon, fast=args.fast)
-        preds = run_predictions(live_df, horizon_days=horizon, persist=True)
+        preds = engine.run_predictions(live_df, horizon_days=horizon, persist=True)
         top_cols = ["player_name", "current_ovr", "predicted_ovr_delta",
                      "upgrade_probability", "investment_score",
                      "expected_value_per_card", "roi_pct"]

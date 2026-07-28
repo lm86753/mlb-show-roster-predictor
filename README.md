@@ -56,3 +56,4 @@ The daily pipeline scores three snapshots before each roster update:
 ## Disclaimer
 
 Predictions are experimental estimates, not guarantees. San Diego Studio controls all final rating changes.
+THIS IS JUST FOR FUN AND 100% VIBE CODED JUST TO TEST RANDOM AI STUFF

@@ -1,2 +1,0 @@
-# No third-party dependencies required.
-# The Vercel function is implemented with the Python standard library only.
