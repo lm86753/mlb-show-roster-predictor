@@ -1,15 +1,16 @@
-data/card_images_real/
-data/card_images/
-data/raw/
-data/cache/
-data/processed/
+# Exclude large data, environment, and dependency directories from deployment
 data/predictor.db
 data/predictor.db.bak
 data/predictor.db-journal
+data/raw/
+data/cache/
+data/processed/
+data/models/
 .venv/
 .venv_new/
 venv/
 web/node_modules/
+.kilo/
 __pycache__/
 *.pyc
 .pytest_cache/

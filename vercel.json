@@ -2,12 +2,12 @@
   "buildCommand": "cd web && npm install && npm run build",
   "outputDirectory": "web/dist",
   "functions": {
-    "api/index.py": {
+    "vercel_app/index.py": {
       "maxDuration": 30
     }
   },
   "routes": [
-    { "src": "/api/(.*)", "dest": "/api/index.py" },
+    { "src": "/api/(.*)", "dest": "/vercel_app/index.py" },
     { "handle": "filesystem" },
     { "src": "/(.*)", "dest": "/index.html" }
   ]
