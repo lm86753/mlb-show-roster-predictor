@@ -6,6 +6,9 @@ data/raw/
 data/cache/
 data/processed/
 data/models/
+data/card_images_real/
+data/card_images/
+src/
 .venv/
 .venv_new/
 venv/
