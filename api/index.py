@@ -136,8 +136,8 @@ def _match_path(route: str, actual: str) -> dict | None:
 router = Router()
 
 
-async def _send_json(handler, request, receive, send, status=200):
-    resp = _cors_response(status, handler(request))
+async def _send_json(body, request, receive, send, status=200):
+    resp = _cors_response(status, body)
     await send({
         "type": "http.response.start",
         "status": resp["statusCode"],
@@ -150,125 +150,109 @@ async def _send_json(handler, request, receive, send, status=200):
     })
 
 
-def _handler_health(request, receive, send):
-    async def wrapped(request, receive, send):
-        await _send_json(lambda r: {"status": "ok"}, request, receive, send)
-    return wrapped
+async def _handler_health(request, receive, send):
+    await _send_json({"status": "ok"}, request, receive, send)
 
 
-def _handler_dashboard(request, receive, send):
-    async def wrapped(request, receive, send):
-        result = dict(_STATIC_CACHE)
-        result["update_status"] = {"latest": None, "days_since": None, "days_until": None}
-        await _send_json(lambda r: result, request, receive, send)
-    return wrapped
+async def _handler_dashboard(request, receive, send):
+    result = dict(_STATIC_CACHE)
+    result["update_status"] = {"latest": None, "days_since": None, "days_until": None}
+    await _send_json(result, request, receive, send)
 
 
-def _handler_predictions(request, receive, send):
-    async def wrapped(request, receive, send):
-        limit = int(request.get("query_params", {}).get("limit", 50))
-        min_upgrade_prob = float(request.get("query_params", {}).get("min_upgrade_prob", 0.0))
-        preds = _STATIC_CACHE.get("predictions", [])
-        filtered = [p for p in preds if p.get("upgrade_probability", 0) >= min_upgrade_prob]
-        filtered = sorted(filtered, key=lambda p: p.get("upgrade_probability", 0), reverse=True)[:limit]
-        await _send_json(lambda r: {"count": len(filtered), "predictions": filtered}, request, receive, send)
-    return wrapped
+async def _handler_predictions(request, receive, send):
+    limit = int(request.get("query_params", {}).get("limit", 50))
+    min_upgrade_prob = float(request.get("query_params", {}).get("min_upgrade_prob", 0.0))
+    preds = _STATIC_CACHE.get("predictions", [])
+    filtered = [p for p in preds if p.get("upgrade_probability", 0) >= min_upgrade_prob]
+    filtered = sorted(filtered, key=lambda p: p.get("upgrade_probability", 0), reverse=True)[:limit]
+    await _send_json({"count": len(filtered), "predictions": filtered}, request, receive, send)
 
 
-def _handler_player_search(request, receive, send):
-    async def wrapped(request, receive, send):
-        q = request.get("query_params", {}).get("q", "")
-        preds = _STATIC_CACHE.get("predictions", [])
-        results = [p for p in preds if q.lower() in p.get("player_name", "").lower()][:50]
-        await _send_json(lambda r: {"query": q, "count": len(results), "results": results}, request, receive, send)
-    return wrapped
+async def _handler_player_search(request, receive, send):
+    q = request.get("query_params", {}).get("q", "")
+    preds = _STATIC_CACHE.get("predictions", [])
+    results = [p for p in preds if q.lower() in p.get("player_name", "").lower()][:50]
+    await _send_json({"query": q, "count": len(results), "results": results}, request, receive, send)
 
 
-def _handler_player(request, receive, send):
-    async def wrapped(request, receive, send):
-        card_uuid = request.get("path_params", {}).get("card_uuid", "")
-        preds = _STATIC_CACHE.get("predictions", [])
-        for p in preds:
-            if p.get("card_uuid") == card_uuid:
-                await _send_json(lambda r: p, request, receive, send)
+async def _handler_player(request, receive, send):
+    card_uuid = request.get("path_params", {}).get("card_uuid", "")
+    preds = _STATIC_CACHE.get("predictions", [])
+    for p in preds:
+        if p.get("card_uuid") == card_uuid:
+            await _send_json(p, request, receive, send)
+            return
+    resp = _cors_response(404, {"detail": "Player prediction not found"})
+    await send({
+        "type": "http.response.start",
+        "status": resp["statusCode"],
+        "headers": [(k.lower().encode("utf-8"), v.encode("utf-8")) for k, v in resp["headers"].items()],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": resp["body"].encode("utf-8"),
+        "more_body": False,
+    })
+
+
+async def _handler_accuracy(request, receive, send):
+    await _send_json({"metrics": []}, request, receive, send)
+
+
+async def _handler_update_status(request, receive, send):
+    await _send_json({
+        "is_update_today": False,
+        "latest_update_date": None,
+        "days_since_last_update": None,
+        "next_expected_update": None,
+        "days_until_next_update": None,
+    }, request, receive, send)
+
+
+async def _handler_card_image(request, receive, send):
+    card_uuid = request.get("path_params", {}).get("card_uuid", "")
+    for d in _CARD_IMG_DIRS:
+        if d.exists():
+            f = d / f"{card_uuid}.png"
+            if f.exists():
+                headers = {
+                    "content-type": "image/png",
+                    "access-control-allow-origin": "*",
+                    "access-control-allow-methods": "GET, OPTIONS",
+                    "access-control-allow-headers": "*",
+                }
+                await send({
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(k.lower().encode("utf-8"), v.encode("utf-8")) for k, v in headers.items()],
+                })
+                await send({
+                    "type": "http.response.body",
+                    "body": f.read_bytes(),
+                    "more_body": False,
+                })
                 return
-        resp = _cors_response(404, {"detail": "Player prediction not found"})
-        await send({
-            "type": "http.response.start",
-            "status": resp["statusCode"],
-            "headers": [(k.lower().encode("utf-8"), v.encode("utf-8")) for k, v in resp["headers"].items()],
-        })
-        await send({
-            "type": "http.response.body",
-            "body": resp["body"].encode("utf-8"),
-            "more_body": False,
-        })
-    return wrapped
-
-
-def _handler_accuracy(request, receive, send):
-    async def wrapped(request, receive, send):
-        await _send_json(lambda r: {"metrics": []}, request, receive, send)
-    return wrapped
-
-
-def _handler_update_status(request, receive, send):
-    async def wrapped(request, receive, send):
-        await _send_json(lambda r: {
-            "is_update_today": False,
-            "latest_update_date": None,
-            "days_since_last_update": None,
-            "next_expected_update": None,
-            "days_until_next_update": None,
-        }, request, receive, send)
-    return wrapped
-
-
-def _handler_card_image(request, receive, send):
-    async def wrapped(request, receive, send):
-        card_uuid = request.get("path_params", {}).get("card_uuid", "")
-        for d in _CARD_IMG_DIRS:
-            if d.exists():
-                f = d / f"{card_uuid}.png"
-                if f.exists():
-                    headers = {
-                        "content-type": "image/png",
-                        "access-control-allow-origin": "*",
-                        "access-control-allow-methods": "GET, OPTIONS",
-                        "access-control-allow-headers": "*",
-                    }
-                    await send({
-                        "type": "http.response.start",
-                        "status": 200,
-                        "headers": [(k.lower().encode("utf-8"), v.encode("utf-8")) for k, v in headers.items()],
-                    })
-                    await send({
-                        "type": "http.response.body",
-                        "body": f.read_bytes(),
-                        "more_body": False,
-                    })
-                    return
-        svg = """<svg xmlns="http://www.w3.org/2000/svg" width="400" height="560">
-          <rect width="400" height="560" fill="#1a1a2e" rx="12"/>
-          <text x="200" y="280" text-anchor="middle" fill="#666" font-family="sans-serif" font-size="24">No Image</text>
-        </svg>"""
-        headers = {
-            "content-type": "image/svg+xml",
-            "access-control-allow-origin": "*",
-            "access-control-allow-methods": "GET, OPTIONS",
-            "access-control-allow-headers": "*",
-        }
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [(k.lower().encode("utf-8"), v.encode("utf-8")) for k, v in headers.items()],
-        })
-        await send({
-            "type": "http.response.body",
-            "body": svg.encode("utf-8"),
-            "more_body": False,
-        })
-    return wrapped
+    svg = """<svg xmlns="http://www.w3.org/2000/svg" width="400" height="560">
+      <rect width="400" height="560" fill="#1a1a2e" rx="12"/>
+      <text x="200" y="280" text-anchor="middle" fill="#666" font-family="sans-serif" font-size="24">No Image</text>
+    </svg>"""
+    headers = {
+        "content-type": "image/svg+xml",
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET, OPTIONS",
+        "access-control-allow-headers": "*",
+    }
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(k.lower().encode("utf-8"), v.encode("utf-8")) for k, v in headers.items()],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": svg.encode("utf-8"),
+        "more_body": False,
+    })
 
 
 router.add_route("/api/health", "GET", _handler_health)
