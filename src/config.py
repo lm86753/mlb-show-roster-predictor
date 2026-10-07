@@ -117,8 +117,51 @@ PITCHER_ATTRS = [
 MIN_AB_21D = 20
 MIN_IP_21D = 10
 
-QS_TIERS = [
-    (0, 25), (65, 100), (75, 300), (80, 600),
-    (85, 1000), (90, 5000), (92, 10000),
-    (94, 25000), (95, 50000), (97, 100000),
-]
+# Attribute ratings run 0-125 in The Show (OVR is capped at 99).
+RATING_MAX = 125
+
+# The attributes SDS actually moves in the monthly attribute updates, keyed by
+# which MLB stat group drives them. Everything else changes so rarely
+# (defense, speed, velocity) that we predict no change for it.
+CORE_ATTRS = {
+    "hitting": [
+        "contact_left", "contact_right", "power_left", "power_right",
+        "plate_vision", "batting_clutch",
+    ],
+    "pitching": [
+        "h_per_9_r", "k_per_9_r", "k_per_9_l", "pitching_clutch", "stamina",
+    ],
+}
+ATTR_GROUP = {a: g for g, attrs in CORE_ATTRS.items() for a in attrs}
+
+# Canonical attribute → field name on the SDS card item.
+CARD_FIELDS = {
+    "contact_left": "contact_left", "contact_right": "contact_right",
+    "power_left": "power_left", "power_right": "power_right",
+    "plate_vision": "plate_vision", "batting_clutch": "batting_clutch",
+    "h_per_9_r": "hits_per_bf_right", "k_per_9_r": "k_per_bf_right",
+    "k_per_9_l": "k_per_bf_left", "pitching_clutch": "pitching_clutch",
+    "stamina": "stamina",
+}
+
+# An update that touches at least this many cards is a monthly attribute
+# update; the small weekly ones are injuries/role changes.
+MAJOR_UPDATE_MIN_CARDS = 100
+
+# Live Series quicksell values by OVR (MLB The Show 26).
+_QS_BY_OVR = {
+    75: 50, 76: 75, 77: 100, 78: 125, 79: 150,
+    80: 400, 81: 600, 82: 900, 83: 1200, 84: 1500,
+    85: 3000, 86: 3750, 87: 4500, 88: 5500, 89: 7000,
+    90: 8000, 91: 9000,
+}
+
+
+def quicksell_value(ovr: int) -> int:
+    if ovr < 65:
+        return 5
+    if ovr < 75:
+        return 25
+    if ovr >= 92:
+        return 10000
+    return _QS_BY_OVR[ovr]

@@ -17,6 +17,12 @@ def fetch_live_series_cards(game_year: int = 26) -> dict:
     total_pages = first.get("total_pages", 1)
 
     with Session() as session:
+        # Keep MLB ID links across refreshes so we don't re-search ~2k names.
+        known_ids = {
+            uuid: mlb_id
+            for uuid, mlb_id in session.query(CardSnapshot.card_uuid, CardSnapshot.mlb_player_id)
+            .filter(CardSnapshot.mlb_player_id.isnot(None))
+        }
         session.query(CardSnapshot).filter_by(game_year=game_year).delete()
 
         for page in range(1, total_pages + 1):
@@ -37,6 +43,7 @@ def fetch_live_series_cards(game_year: int = 26) -> dict:
                         rarity=item.get("rarity", ""),
                         series=item.get("series", "Live"),
                         is_hitter=0 if item.get("display_position") in {"SP", "RP", "CP"} else 1,
+                        mlb_player_id=known_ids.get(item.get("uuid", "")),
                         attributes_json=dumps(attrs),
                     )
                 )

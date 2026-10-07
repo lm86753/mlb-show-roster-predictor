@@ -119,9 +119,14 @@ class Prediction(Base):
     current_ovr = Column(Integer)
     current_rarity = Column(String(32))
     predicted_ovr_delta = Column(Float)
-    upgrade_probability = Column(Float)
-    downgrade_probability = Column(Float)
+    upgrade_probability = Column(Float, default=0.0)
+    downgrade_probability = Column(Float, default=0.0)
+    investment_score = Column(Float)
+    expected_value_per_card = Column(Float)
+    roi_pct = Column(Float)
     tier_jump_probability = Column(Float)
+    tier_down_probability = Column(Float, default=0.0)
+    ovr_delta_sd = Column(Float)
     sample_size_ok = Column(Integer, default=1)
     horizon_days = Column(Integer, default=1)
     attributes_json = Column(Text)
@@ -150,7 +155,36 @@ def get_engine(db_path: Path | None = None):
 def init_db(db_path: Path | None = None) -> sessionmaker[Session]:
     engine = get_engine(db_path)
     Base.metadata.create_all(engine)
+    _migrate_predictions_columns(engine)
     return sessionmaker(bind=engine)
+
+
+def _migrate_predictions_columns(engine) -> None:
+    """Add new columns to the predictions table if missing (SQLite ALTER TABLE)."""
+    import sqlalchemy as sa
+    new_cols = [
+        ("upgrade_probability", sa.Float),
+        ("downgrade_probability", sa.Float),
+        ("investment_score", sa.Float),
+        ("expected_value_per_card", sa.Float),
+        ("roi_pct", sa.Float),
+        ("tier_down_probability", sa.Float),
+        ("ovr_delta_sd", sa.Float),
+    ]
+    with engine.connect() as conn:
+        try:
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(predictions)")}
+        except Exception:
+            return
+        for name, col_type in new_cols:
+            if name not in existing:
+                try:
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE predictions ADD COLUMN {name} {col_type().compile()}"
+                    )
+                    conn.commit()
+                except Exception:
+                    pass
 
 
 def safe_init_db() -> sessionmaker[Session] | None:

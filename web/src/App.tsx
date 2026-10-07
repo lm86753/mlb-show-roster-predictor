@@ -1,186 +1,202 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { fetchDashboard } from './api'
-import type { Prediction, Filters, UpdateStatus } from './types'
-import Header from './components/Header'
-import Sidebar from './components/Sidebar'
-import PlayerCard from './components/PlayerCard'
-import Pagination from './components/Pagination'
+import type { DashboardResponse, Prediction } from './types'
+import { RARITY_ORDER, pct, shortDate } from './types'
+import TopBar from './components/TopBar'
+import PlayerTable, { type Sort, type SortKey } from './components/PlayerTable'
+import CardGrid from './components/CardGrid'
+import PlayerDrawer from './components/PlayerDrawer'
+import Methodology from './components/Methodology'
+import { Icon, Segmented } from './components/ui'
 
-const defaultFilters: Filters = {
-  searchText: '',
-  deltaRange: [-15, 15] as [number, number],
-  changeProbRange: [0, 1] as [number, number],
-  consensusRange: [-1, 1] as [number, number],
-  selectedTeams: [],
-  selectedRarities: [],
-  sortBy: 'current_ovr',
-  sortAsc: false,
-  colsPerRow: 3,
-  pageSize: 24,
+type Tab = 'up' | 'down' | 'value' | 'all'
+type Group = 'all' | 'hitters' | 'pitchers'
+type Layout = 'table' | 'cards'
+
+const PAGE_SIZE = 50
+
+const TABS: { id: Tab; label: string; filter: (p: Prediction) => boolean; sort: Sort }[] = [
+  { id: 'up', label: 'Likely upgrades', filter: p => p.upgrade_probability >= 0.3, sort: { key: 'upgrade_probability', dir: 'desc' } },
+  { id: 'down', label: 'Likely downgrades', filter: p => p.downgrade_probability >= 0.3, sort: { key: 'downgrade_probability', dir: 'desc' } },
+  { id: 'value', label: 'Quicksell value', filter: p => (p.expected_value_per_card ?? 0) >= 1, sort: { key: 'expected_value_per_card', dir: 'desc' } },
+  { id: 'all', label: 'All cards', filter: () => true, sort: { key: 'current_ovr', dir: 'desc' } },
+]
+
+function compare(a: Prediction, b: Prediction, key: SortKey): number {
+  if (key === 'player_name') return a.player_name.localeCompare(b.player_name)
+  return (a[key] ?? 0) - (b[key] ?? 0)
 }
 
-function App() {
-  const [predictions, setPredictions] = useState<Prediction[]>([])
-  const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null)
-  const [loading, setLoading] = useState(true)
+export default function App() {
+  const [data, setData] = useState<DashboardResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [filters, setFilters] = useState<Filters>(defaultFilters)
-  const [page, setPage] = useState(1)
+
+  const [tab, setTab] = useState<Tab>('up')
+  const [sort, setSort] = useState<Sort>(TABS[0].sort)
+  const [query, setQuery] = useState('')
+  const [group, setGroup] = useState<Group>('all')
+  const [rarity, setRarity] = useState('')
+  const [team, setTeam] = useState('')
+  const [layout, setLayout] = useState<Layout>('table')
+  const [page, setPage] = useState(0)
+  const [selected, setSelected] = useState<string | null>(null)
+  const [showMethod, setShowMethod] = useState(false)
 
   useEffect(() => {
-    fetchDashboard()
-      .then(data => {
-        setPredictions(data.predictions)
-        setUpdateStatus(data.update_status)
-        setLoading(false)
-      })
-      .catch(err => {
-        setError(err.message)
-        setLoading(false)
-      })
+    fetchDashboard().then(setData).catch(err => setError(err.message))
   }, [])
 
-  const filtered = useMemo(() => {
-    let result = [...predictions]
+  const predictions = useMemo(() => data?.predictions ?? [], [data])
+  const teams = useMemo(() => [...new Set(predictions.map(p => p.team).filter(Boolean) as string[])].sort(), [predictions])
 
-    if (filters.searchText) {
-      const q = filters.searchText.toLowerCase()
-      result = result.filter(p =>
-        p.player_name?.toLowerCase().includes(q) ||
-        p.team?.toLowerCase().includes(q)
-      )
-    }
-
-    if (filters.selectedTeams.length > 0) {
-      result = result.filter(p => p.team && filters.selectedTeams.includes(p.team))
-    }
-
-    if (filters.selectedRarities.length > 0) {
-      result = result.filter(p => filters.selectedRarities.includes(p.current_rarity))
-    }
-
-    result = result.filter(p => {
-      const delta = p.predicted_ovr_delta ?? 0
-      const consensus = p.direction_consensus ?? 0
-      const changeProb = p.attributes?.length
-        ? p.attributes.reduce((s, a) => s + (a.change_prob || 0), 0) / p.attributes.length
-        : 0
-      return (
-        delta >= filters.deltaRange[0] && delta <= filters.deltaRange[1] &&
-        changeProb >= filters.changeProbRange[0] && changeProb <= filters.changeProbRange[1] &&
-        consensus >= filters.consensusRange[0] && consensus <= filters.consensusRange[1]
-      )
-    })
-
-    result.sort((a, b) => {
-      const getVal = (p: Prediction): number | string => {
-        const val = p[filters.sortBy as keyof Prediction]
-        if (typeof val === 'number') return val
-        if (typeof val === 'string') return val
-        return 0
-      }
-      const aVal = getVal(a)
-      const bVal = getVal(b)
-      if (typeof aVal === 'string' && typeof bVal === 'string') {
-        return filters.sortAsc ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal)
-      }
-      return filters.sortAsc
-        ? (aVal as number) - (bVal as number)
-        : (bVal as number) - (aVal as number)
-    })
-
-    return result
-  }, [predictions, filters])
-
-  const totalPages = Math.max(1, Math.ceil(filtered.length / filters.pageSize))
-  const safePage = Math.max(1, Math.min(page, totalPages))
-  const startIdx = (safePage - 1) * filters.pageSize
-  const endIdx = Math.min(startIdx + filters.pageSize, filtered.length)
-  const pageData = filtered.slice(startIdx, endIdx)
-
-  useEffect(() => {
-    setPage(1)
-  }, [filters])
-
-  const upCount = filtered.filter(p => (p.predicted_ovr_delta ?? 0) > 0.5).length
-  const dnCount = filtered.filter(p => (p.predicted_ovr_delta ?? 0) < -0.5).length
-
-  if (loading) {
-    return (
-      <div style={{ background: '#0f1419', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-        <div style={{ color: '#a0aec0', fontSize: 16 }}>Loading predictions...</div>
-      </div>
+  // Everything except the tab filter, so tab counts reflect the other filters.
+  const base = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    return predictions.filter(p =>
+      (!q || p.player_name.toLowerCase().includes(q) || (p.team ?? '').toLowerCase().includes(q)) &&
+      (group === 'all' || (group === 'hitters' ? !!p.is_hitter : !p.is_hitter)) &&
+      (!rarity || p.current_rarity === rarity) &&
+      (!team || p.team === team),
     )
-  }
+  }, [predictions, query, group, rarity, team])
+
+  const counts = useMemo(() => Object.fromEntries(TABS.map(t => [t.id, base.filter(t.filter).length])) as Record<Tab, number>, [base])
+
+  const rows = useMemo(() => {
+    const t = TABS.find(x => x.id === tab)!
+    const dir = sort.dir === 'asc' ? 1 : -1
+    return base.filter(t.filter).sort((a, b) => dir * compare(a, b, sort.key) || b.current_ovr - a.current_ovr)
+  }, [base, tab, sort])
+
+  useEffect(() => { setPage(0) }, [query, group, rarity, team, tab, sort])
+
+  const summary = useMemo(() => ({
+    up: predictions.filter(p => p.upgrade_probability >= 0.5).length,
+    down: predictions.filter(p => p.downgrade_probability >= 0.5).length,
+    tier: predictions.filter(p => p.tier_jump_probability >= 0.25).length,
+  }), [predictions])
+
+  const dataAsOf = useMemo(() => {
+    const t = Math.max(0, ...predictions.map(p => Date.parse(p.created_at) || 0))
+    return t ? new Date(t).toISOString() : null
+  }, [predictions])
+
+  const onTab = (t: Tab) => { setTab(t); setSort(TABS.find(x => x.id === t)!.sort) }
+  const onSort = (key: SortKey) =>
+    setSort(s => (s.key === key ? { key, dir: s.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: key === 'player_name' ? 'asc' : 'desc' }))
+  const closeDrawer = useCallback(() => setSelected(null), [])
+  const closeMethod = useCallback(() => setShowMethod(false), [])
 
   if (error) {
     return (
-      <div style={{ background: '#0f1419', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-        <div style={{ color: '#f56565', fontSize: 16 }}>
-          Error loading data: {error}. Make sure the API server is running.
-        </div>
+      <div className="state">
+        <strong style={{ color: 'var(--text)' }}>Couldn't load forecasts</strong>
+        <span>{error}. Check that the API is running, then reload.</span>
+        <button className="btn" onClick={() => location.reload()}>Reload</button>
       </div>
     )
   }
+  if (!data) return <div className="state">Loading forecasts&hellip;</div>
+
+  const pageRows = rows.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
+  const lastPage = Math.max(0, Math.ceil(rows.length / PAGE_SIZE) - 1)
+  const m = data.model?.metrics
+  const status = data.update_status
+  const selectedPrediction = predictions.find(p => p.card_uuid === selected)
 
   return (
-    <div style={{ background: '#0f1419', minHeight: '100vh', color: '#e2e8f0', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
-      <Header status={updateStatus} />
+    <>
+      <TopBar status={status} dataAsOf={dataAsOf} onMethodology={() => setShowMethod(true)} />
 
-      <div style={{ display: 'flex' }}>
-        <Sidebar predictions={predictions} filters={filters} onFilterChange={filters => { setFilters(filters); setPage(1) }} />
+      <main className="page">
+        <h1 className="page-title">Next attribute update forecast</h1>
+        <p className="page-lede">
+          Every Live Series card, scored on how its ratings are likely to move when San Diego Studio
+          next re-rates players{status.last_attribute_update ? ` (last update ${shortDate(status.last_attribute_update)})` : ''}.
+        </p>
 
-        <div style={{ flex: 1, padding: 16, overflow: 'hidden' }}>
-          {/* Summary bar */}
-          <div style={{ display: 'flex', gap: 12, marginBottom: 8, flexWrap: 'wrap' }}>
-            <span style={{ background: '#1a202c', padding: '4px 12px', borderRadius: 8, border: '1px solid #2d3748', color: '#a0aec0', fontSize: 12 }}>
-              <strong style={{ color: '#f7fafc' }}>{filtered.length}</strong> players
-            </span>
-            <span style={{ background: '#48bb7818', padding: '4px 12px', borderRadius: 8, border: '1px solid #48bb7844', color: '#48bb78', fontSize: 12 }}>
-              &#9650; <strong>{upCount}</strong> upgrades
-            </span>
-            <span style={{ background: '#f5656518', padding: '4px 12px', borderRadius: 8, border: '1px solid #f5656544', color: '#f56565', fontSize: 12 }}>
-              &#9660; <strong>{dnCount}</strong> downgrades
-            </span>
+        <div className="summary">
+          <div className="summary-item">
+            <div className="summary-value num up">{summary.up}</div>
+            <div className="summary-label">cards 50%+ likely to upgrade</div>
           </div>
-
-          <div style={{ color: '#718096', fontSize: 12, marginBottom: 6 }}>
-            Showing {startIdx + 1}&ndash;{endIdx} of {filtered.length}
+          <div className="summary-item">
+            <div className="summary-value num down">{summary.down}</div>
+            <div className="summary-label">cards 50%+ likely to downgrade</div>
           </div>
-
-          {pageData.length === 0 ? (
-            <div style={{ color: '#a0aec0', textAlign: 'center', padding: 40 }}>
-              No players match the current filters.
-            </div>
-          ) : (
-            <div style={{
-              display: 'grid',
-              gridTemplateColumns: `repeat(${filters.colsPerRow}, 1fr)`,
-              gap: 12,
-            }}>
-              {pageData.map(p => (
-                <PlayerCard key={p.card_uuid} prediction={p} />
-              ))}
+          <div className="summary-item">
+            <div className="summary-value num tier">{summary.tier}</div>
+            <div className="summary-label">cards 25%+ likely to jump a rarity tier</div>
+          </div>
+          {m && (
+            <div className="summary-item">
+              <div className="summary-value num">{pct(m.top25_up_hit_rate)}</div>
+              <div className="summary-label">
+                of top-25 upgrade picks went up in backtests{' '}
+                <button className="btn-link" onClick={() => setShowMethod(true)}>Details</button>
+              </div>
             </div>
           )}
-
-          <Pagination
-            page={safePage}
-            totalPages={totalPages}
-            startIdx={startIdx}
-            endIdx={endIdx}
-            total={filtered.length}
-            onPageChange={setPage}
-          />
-
-          <hr style={{ borderColor: '#2d3748', margin: '16px 0' }} />
-          <div style={{ textAlign: 'center', color: '#4a5568', fontSize: 11 }}>
-            Data from MLB The Show 26 roster updates &bull; Real card images from The Show CDN &bull; Predictions are formula-based estimates, not financial advice
-          </div>
         </div>
-      </div>
-    </div>
+
+        <div className="tabs" role="tablist" aria-label="Forecast views">
+          {TABS.map(t => (
+            <button key={t.id} role="tab" className="tab" aria-selected={tab === t.id} onClick={() => onTab(t.id)}>
+              {t.label}<span className="tab-count num">{counts[t.id].toLocaleString()}</span>
+            </button>
+          ))}
+        </div>
+
+        <div className="toolbar">
+          <label className="visually-hidden" htmlFor="search">Search players or teams</label>
+          <input id="search" className="input search" type="search" placeholder="Search players or teams"
+            value={query} onChange={e => setQuery(e.target.value)} />
+          <Segmented<Group> label="Player type" value={group} onChange={setGroup} options={[
+            { value: 'all', label: 'All' }, { value: 'hitters', label: 'Hitters' }, { value: 'pitchers', label: 'Pitchers' },
+          ]} />
+          <select className="select" aria-label="Rarity" value={rarity} onChange={e => setRarity(e.target.value)}>
+            <option value="">All rarities</option>
+            {RARITY_ORDER.slice().reverse().map(r => <option key={r} value={r}>{r}</option>)}
+          </select>
+          <select className="select" aria-label="Team" value={team} onChange={e => setTeam(e.target.value)}>
+            <option value="">All teams</option>
+            {teams.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+          <span className="grow" />
+          <Segmented<Layout> label="Layout" value={layout} onChange={setLayout} options={[
+            { value: 'table', label: <Icon name="table" />, title: 'Table' },
+            { value: 'cards', label: <Icon name="cards" />, title: 'Cards' },
+          ]} />
+        </div>
+
+        {rows.length === 0 ? (
+          <div className="table-wrap empty">No cards match these filters.</div>
+        ) : layout === 'table' ? (
+          <PlayerTable rows={pageRows} sort={sort} onSort={onSort} selected={selected} onSelect={setSelected} />
+        ) : (
+          <CardGrid rows={pageRows} onSelect={setSelected} />
+        )}
+
+        {rows.length > PAGE_SIZE && (
+          <div className="pager">
+            <span className="num">
+              {(page * PAGE_SIZE + 1).toLocaleString()}&ndash;{Math.min(rows.length, (page + 1) * PAGE_SIZE).toLocaleString()} of {rows.length.toLocaleString()}
+            </span>
+            <div className="pager-buttons">
+              <button className="btn" disabled={page === 0} onClick={() => setPage(p => p - 1)}>Previous</button>
+              <button className="btn" disabled={page >= lastPage} onClick={() => setPage(p => p + 1)}>Next</button>
+            </div>
+          </div>
+        )}
+
+        <footer className="footer">
+          <span>Ratings and card art from The Show's public API. Stats from the MLB Stats API.</span>
+          <span>Fan project, not affiliated with San Diego Studio or MLB. Forecasts are estimates.</span>
+        </footer>
+      </main>
+
+      {selectedPrediction && <PlayerDrawer prediction={selectedPrediction} model={data.model} onClose={closeDrawer} />}
+      {showMethod && <Methodology model={data.model} onClose={closeMethod} />}
+    </>
   )
 }
-
-export default App
