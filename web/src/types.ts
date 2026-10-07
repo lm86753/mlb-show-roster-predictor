@@ -2,11 +2,17 @@ export interface AttributeItem {
   attribute_name: string
   rating_before: number
   projected_rating: number
+  /** Rating the card's stats usually earn, per the fitted projector */
+  stat_projection: number | null
   predicted_delta: number
-  gap: number
+  gap: number | null
+  /** 80% range for the attribute change */
+  confidence_low: number
+  confidence_high: number
+  upgrade_prob_attr: number
+  downgrade_prob_attr: number
   change_prob: number
-  has_stat_data: number
-  mismatch_score: number
+  last_delta: number
 }
 
 export interface Prediction {
@@ -15,19 +21,43 @@ export interface Prediction {
   mlb_player_id: number | null
   current_ovr: number
   current_rarity: string
+  current_qs: number
   predicted_ovr_delta: number
+  ovr_delta_sd: number | null
   upgrade_probability: number
   downgrade_probability: number
   tier_jump_probability: number
+  tier_down_probability: number
   sample_size_ok: boolean
-  avg_gap: number
-  direction_consensus: number
   team: string | null
   position: string | null
   is_hitter: number | null
-  has_card_image: boolean
   attributes: AttributeItem[]
   created_at: string
+  /** Probability-weighted quicksell change per card (stubs) */
+  expected_value_per_card: number | null
+  stats?: PlayerStats
+}
+
+export type StatLine = Record<string, number | null>
+
+export interface PlayerStats {
+  group?: 'hitting' | 'pitching'
+  season?: StatLine
+  last30?: StatLine
+  last_season?: StatLine
+}
+
+export interface ReviewPick {
+  card_uuid: string
+  player_name: string
+  ovr_before: number
+  ovr_after: number
+  predicted_delta: number
+  upgrade_probability: number
+  downgrade_probability: number
+  expected_qs_change: number
+  realized_qs_change: number
 }
 
 export interface UpdateStatus {
@@ -36,85 +66,129 @@ export interface UpdateStatus {
   days_until: number | null
   next_expected: string | null
   is_update_today: boolean
+  last_attribute_update?: string | null
+  cadence_days?: number
+}
+
+export interface BacktestMetrics {
+  ovr_spearman: number
+  attr_direction_acc: number
+  interval_coverage: number
+  upgrade_brier: number
+  upgrade_brier_baseline: number
+  upgrade_prob_mean: number
+  base_rate_up: number
+  base_rate_down: number
+  top25_up_hit_rate: number
+  top25_up_avg_ovr_delta: number
+  top25_down_hit_rate: number
+  top25_ev_avg_qs_gain: number
+  all_avg_qs_gain: number
+}
+
+export interface BacktestFold extends Partial<BacktestMetrics> {
+  test_update: string
+  train_updates: number
+}
+
+export interface ModelSummary {
+  trained_on?: string[]
+  metrics?: BacktestMetrics
+  folds?: BacktestFold[]
+  ovr_weights?: Record<'hitting' | 'pitching', Record<string, number>>
+  stat_cutoff_days?: number
+  last_update_review?: {
+    update?: string
+    top_upgrades?: ReviewPick[]
+    top_downgrades?: ReviewPick[]
+    top_value?: ReviewPick[]
+  }
 }
 
 export interface DashboardResponse {
   count: number
   predictions: Prediction[]
   update_status: UpdateStatus
+  model?: ModelSummary
 }
 
-export const TEAM_COLORS: Record<string, string> = {
-  Angels: "#BA0C2F", Astros: "#183469", Giants: "#FD5A1E", Dodgers: "#005A9C",
-  Braves: "#CE1141", Phillies: "#E81828", Orioles: "#DF4601", Rays: "#008080",
-  Twins: "#002B5C", "Blue Jays": "#134A8E", "Red Sox": "#BD3039", "White Sox": "#27251F",
-  Yankees: "#003087", Athletics: "#003831", Guardians: "#0C2340", Tigers: "#0C1B38",
-  Royals: "#004687", Rockies: "#33006F", Marlins: "#00A3E0", Brewers: "#FFC72C",
-  Cardinals: "#C41E3A", Nationals: "#AB0003", Mets: "#002D72", Pirates: "#27251F",
-  Padres: "#2F241D", Rangers: "#003278", Reds: "#C6011F", Cubs: "#0E3386",
-  Diamondbacks: "#A71930", Mariners: "#0C2C56",
+export interface HistoryUpdate {
+  update_date: string
+  update_name: string
+  ovr_before: number | null
+  ovr_after: number | null
+  changes: { attribute: string; rating_before: number; rating_after: number; delta: number }[]
 }
 
-export const RARITY_COLORS: Record<string, string> = {
-  "Red Diamond": "#FF0044", Diamond: "#00BFFF", Gold: "#FFD700", Silver: "#C0C0C0", Bronze: "#CD7F32", Common: "#808080",
-}
-
-export const RARITY_ORDER: Record<string, number> = {
-  Common: 0, Bronze: 1, Silver: 2, Gold: 3, Diamond: 4, "Red Diamond": 5,
-}
+/* ── Attributes ── */
 
 export const HITTER_ATTRS: [string, string][] = [
-  ["contact_right", "Con R"], ["contact_left", "Con L"],
-  ["power_right", "Pow R"], ["power_left", "Pow L"],
-  ["plate_vision", "Vis"], ["batting_clutch", "Clutch"],
-  ["plate_discipline", "Disc"], ["speed", "Spd"],
+  ['contact_right', 'Contact R'], ['contact_left', 'Contact L'],
+  ['power_right', 'Power R'], ['power_left', 'Power L'],
+  ['plate_vision', 'Vision'], ['batting_clutch', 'Clutch'],
 ]
 
 export const PITCHER_ATTRS: [string, string][] = [
-  ["pitch_control", "Ctrl"], ["pitch_movement", "Mov"],
-  ["pitch_velocity", "Vel"], ["pitching_clutch", "P Clutch"],
-  ["stamina", "Stam"], ["k/9_r", "K/9 R"], ["k/9_l", "K/9 L"],
-  ["h/9_r", "H/9 R"], ["h/9", "H/9"], ["bb/9", "BB/9"],
+  ['h_per_9_r', 'H/9 R'], ['k_per_9_r', 'K/9 R'], ['k_per_9_l', 'K/9 L'],
+  ['pitching_clutch', 'Clutch'], ['stamina', 'Stamina'],
 ]
 
-export interface Filters {
-  searchText: string
-  deltaRange: [number, number]
-  changeProbRange: [number, number]
-  consensusRange: [number, number]
-  selectedTeams: string[]
-  selectedRarities: string[]
-  sortBy: string
-  sortAsc: boolean
-  colsPerRow: number
-  pageSize: number
+export const ATTR_LABELS: Record<string, string> = Object.fromEntries([...HITTER_ATTRS, ...PITCHER_ATTRS])
+
+export const RATING_MAX = 125
+export const MAX_CARD_COPIES = 20
+
+export const RARITY_ORDER = ['Common', 'Bronze', 'Silver', 'Gold', 'Diamond']
+
+export const RARITY_COLORS: Record<string, string> = {
+  Diamond: '#3d9fd3', Gold: '#c99a2e', Silver: '#9aa3ad', Bronze: '#a8703f', Common: '#7d8288',
 }
 
-export const QS_TIERS: [number, number][] = [
-  [0, 25], [65, 100], [75, 300], [80, 600], [85, 1000],
-  [90, 5000], [92, 10000], [94, 25000], [95, 50000], [97, 100000],
-]
-
-export function getTeamColor(team: string | null): string {
-  return team ? TEAM_COLORS[team] || "#2d3748" : "#2d3748"
+/** Current card art straight from the SDS CDN (re-baked after every update). */
+export function cardImage(uuid: string, size: 'sm' | 'lg' = 'sm'): string {
+  return `https://cards.theshow.com/mlb26/${uuid}-baked-${size}.webp`
 }
 
-export function getRarityColor(rarity: string): string {
-  return RARITY_COLORS[rarity] || "#808080"
+/* ── Formatting ── */
+
+export function signed(n: number | null | undefined, dp = 1): string {
+  if (n == null || isNaN(n)) return '—'
+  const s = Math.abs(n).toFixed(dp)
+  if (Number(s) === 0) return (0).toFixed(dp)
+  return n > 0 ? `+${s}` : `−${s}`
 }
 
-export function formatDelta(delta: number | null | undefined): string {
-  if (delta == null || isNaN(delta)) return "\u2014"
-  return delta > 0 ? `+${delta.toFixed(1)}` : `${delta.toFixed(1)}`
+export function pct(v: number | null | undefined): string {
+  if (v == null || isNaN(v)) return '—'
+  const p = v * 100
+  if (p > 0 && p < 1) return '<1%'
+  if (p < 100 && p > 99) return '>99%'
+  return `${Math.round(p)}%`
 }
 
-export function deltaColor(delta: number | null | undefined): string {
-  if (delta == null || isNaN(delta)) return "#a0aec0"
-  if (delta > 0) return "#48bb78"
-  if (delta < 0) return "#f56565"
-  return "#a0aec0"
+export function stubs(n: number | null | undefined): string {
+  if (n == null || isNaN(n)) return '—'
+  const r = Math.round(n)
+  return `${r > 0 ? '+' : r < 0 ? '−' : ''}${Math.abs(r).toLocaleString()}`
 }
 
-export function getCardImageUrl(cardUuid: string): string {
-  return `/api/card-image/${cardUuid}`
+export function toneOf(n: number | null | undefined, threshold = 0.05): '' | 'up' | 'down' {
+  if (n == null || isNaN(n)) return ''
+  return n > threshold ? 'up' : n < -threshold ? 'down' : ''
+}
+
+export function shortDate(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  const d = new Date(`${iso.slice(0, 10)}T12:00:00`)
+  return isNaN(d.getTime()) ? iso : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
+/** Batting/pitching rates: .xxx for slash stats, % for rates, 2dp for ERA/WHIP. */
+export function fmtStat(key: string, v: number | null | undefined): string {
+  if (v == null || isNaN(v)) return '—'
+  if (key === 'pa' || key === 'bf') return Math.round(v).toLocaleString()
+  if (['avg', 'obp', 'slg', 'iso'].includes(key)) return v.toFixed(3).replace(/^0/, '')
+  if (key.endsWith('_pct')) return `${(v * 100).toFixed(1)}%`
+  if (key === 'ip_per_g') return v.toFixed(1)
+  return v.toFixed(2)
 }

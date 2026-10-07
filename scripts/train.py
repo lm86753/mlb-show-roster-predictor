@@ -1,49 +1,39 @@
 #!/usr/bin/env python3
-"""Build training dataset, join MLB stats, train models, and run backtest."""
+"""Build the training dataset, run the walk-forward backtest, and fit the model."""
 
 import argparse
 import json
+import logging
 import sys
+import warnings
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.features.engineering import build_training_dataset, persist_training_examples
-from src.ingest.mlb_stats import store_stat_windows_for_updates
+from src.features.dataset import build_training_dataset
 from src.ingest.roster_updates import backfill_roster_updates
-from src.models.evaluate import run_backtest
 from src.models.train import train_all
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train roster update predictor models")
-    parser.add_argument("--skip-backfill", action="store_true")
-    parser.add_argument("--skip-stats", action="store_true")
-    parser.add_argument("--stats-years", type=int, nargs="+", default=[26])
+    parser = argparse.ArgumentParser(description="Train the roster update predictor")
+    parser.add_argument("--game-year", type=int, default=26)
+    parser.add_argument("--skip-backfill", action="store_true", help="Don't pull new SDS roster updates first")
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    warnings.filterwarnings("ignore", category=UserWarning)
 
     if not args.skip_backfill:
         print("Backfilling roster updates...")
-        stats = backfill_roster_updates()
-        print(json.dumps(stats, indent=2))
-
-    if not args.skip_stats:
-        print("Linking MLB stats to update dates (this may take a while)...")
-        count = store_stat_windows_for_updates(game_years=args.stats_years)
-        print(f"Stored {count} stat windows")
+        print(json.dumps(backfill_roster_updates([args.game_year]), indent=2))
 
     print("Building training dataset...")
-    df = build_training_dataset()
-    print(f"Training examples: {len(df)}")
-    persist_training_examples(df)
+    df = build_training_dataset(args.game_year)
+    print(f"Training rows: {len(df):,} across {df['as_of'].nunique()} attribute updates")
 
-    print("Training models...")
-    result = train_all()
-    print(json.dumps(result, indent=2))
-
-    print("Running backtest...")
-    backtest = run_backtest(df)
-    print(json.dumps(backtest, indent=2))
+    summary = train_all(df)
+    print(json.dumps(summary["summary"], indent=2))
 
 
 if __name__ == "__main__":

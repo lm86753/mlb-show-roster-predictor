@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from src.config import ALIAS_MAP, MODELS_DIR
+from src.config import ALIAS_MAP, MODELS_DIR, RATING_MAX
 
 # ─── League-average defaults (used when a stat is missing) ──────────────────
 # These are typical MLB averages so formulas produce a reasonable ~50-60 rating
@@ -94,7 +94,7 @@ ATTR_ALIASES = dict(ALIAS_MAP)
 
 
 def clip_rating(value: float) -> int:
-    return int(max(0, min(99, round(value))))
+    return int(max(0, min(RATING_MAX, round(value))))
 
 
 def _get_stat(stats: dict, key: str) -> float:
@@ -233,13 +233,10 @@ def project_pitcher_attribute(attr: str, stats: dict, coeffs: dict | None = None
 
     if attr == "stamina":
         ip = _get_stat(stats, "ip")
-        gs = _get_stat(stats, "gamesStarted") or _get_stat(stats, "gs") or 1.0
+        gs = _get_stat(stats, "gamesStarted") or _get_stat(stats, "gs")
         if gs < 1:
-            gs = 1.0
+            gs = max(_get_stat(stats, "games") or _get_stat(stats, "g"), 1)
         ip_per_gs = ip / gs
-        # Stamina: flattened slope because stamina upgrades are rare.
-        # Baseline 48, +1.0 per IP/GS — keeps projections ~48-55 range.
-        # League avg starter (~5.5 IP/start) ≈ 53, relievers (~1 IP) ≈ 49.
         return clip_rating(48.0 + ip_per_gs * 1.0)
 
     # k/9 variants (splits vs L/R)

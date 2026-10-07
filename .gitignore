@@ -17,3 +17,6 @@ nul
 streamlit*.log
 .vscode/
 .vercel
+*.db-journal
+.impeccable/
+.claude/launch.json
