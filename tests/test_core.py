@@ -96,3 +96,23 @@ def test_market_metrics_respect_ovr_cap():
     # A 99 can't go up: mass folds back onto "no change".
     assert mm.loc[1, "upgrade_probability"] == pytest.approx(0.0)
     assert mm.loc[1, "p_no_change"] == pytest.approx(1.0)
+
+
+def test_player_resolver_prefers_role_and_team(monkeypatch):
+    from src.ingest import cards
+
+    monkeypatch.setattr(cards, "_team_org_names", lambda: {133: "Athletics", 119: "Dodgers", 145: "White Sox"})
+    dodgers_muncy = {"id": 1, "fullName": "Max Muncy", "primaryPosition": {"abbreviation": "3B"}, "currentTeam": {"id": 119}, "active": True, "mlbDebutDate": "2015-04-25"}
+    as_muncy = {"id": 2, "fullName": "Max Muncy", "primaryPosition": {"abbreviation": "3B"}, "currentTeam": {"id": 133}, "active": True, "mlbDebutDate": "2025-03-27"}
+    romo = {"id": 3, "fullName": "Drew Romo", "primaryPosition": {"abbreviation": "C"}, "currentTeam": {"id": 145}, "active": True}
+    rom = {"id": 4, "fullName": "Drew Rom", "primaryPosition": {"abbreviation": "P"}, "currentTeam": {"id": 133}, "active": True}
+
+    def best(people, name, team, pos):
+        return max(people, key=lambda p: cards.score_candidate(p, name, team, pos))["id"]
+
+    assert best([dodgers_muncy, as_muncy], "Max Muncy", "Athletics", "3B") == 2
+    assert best([dodgers_muncy, as_muncy], "Max Muncy", "Dodgers", "3B") == 1
+    assert best([romo, rom], "Drew Rom", "Athletics", "RP") == 4
+    # A pitcher card must never accept a position player.
+    assert cards.score_candidate(romo, "Drew Rom", "Athletics", "RP") < 3.0
+    assert cards._norm_name("Luis García Jr.") == "luisgarcia"

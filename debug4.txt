@@ -1,0 +1,5 @@
+Orchestrator
+# ═══════════════════════════════════════════════════════════════════════════
+
+def train_all(training_path: Path | None = None) -> dict:
+    path = training_path or PROCESSED_DIR / "t

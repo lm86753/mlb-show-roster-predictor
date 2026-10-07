@@ -1,13 +1,18 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { HistoryUpdate, ModelSummary, Prediction } from '../types'
 import {
   ATTR_LABELS, HITTER_ATTRS, MAX_CARD_COPIES, PITCHER_ATTRS, RATING_MAX,
-  pct, shortDate, signed, stubs, toneOf,
+  fmtStat, pct, shortDate, signed, stubs, toneOf,
 } from '../types'
 import { fetchHistory } from '../api'
 import { CardArt, Icon, Rarity } from './ui'
 
 const RANGE_SPAN = 10 // attribute range bars cover −10…+10
+
+const STAT_ROWS = {
+  hitting: [['avg', 'AVG'], ['obp', 'OBP'], ['slg', 'SLG'], ['k_pct', 'K%'], ['bb_pct', 'BB%'], ['pa', 'PA']],
+  pitching: [['era', 'ERA'], ['whip', 'WHIP'], ['k_pct', 'K%'], ['bb_pct', 'BB%'], ['hr_pct', 'HR%'], ['bf', 'BF']],
+} as const
 
 function RangeBar({ lo, hi, mid }: { lo: number; hi: number; mid: number }) {
   const x = (v: number) => `${((Math.max(-RANGE_SPAN, Math.min(RANGE_SPAN, v)) + RANGE_SPAN) / (2 * RANGE_SPAN)) * 100}%`
@@ -33,17 +38,50 @@ function useHistory(uuid: string) {
   return state?.uuid === uuid ? state.updates : null
 }
 
+function FlipCalculator({ p }: { p: Prediction }) {
+  const [price, setPrice] = useState(String(p.current_qs))
+  const [copies, setCopies] = useState('1')
+  const buy = Math.max(0, Number(price) || 0)
+  const n = Math.max(1, Math.min(MAX_CARD_COPIES, Math.round(Number(copies) || 1)))
+  const expectedQs = p.current_qs + (p.expected_value_per_card ?? 0)
+  const perCard = expectedQs - buy
+  return (
+    <section>
+      <h3>Flip calculator</h3>
+      <div className="calc">
+        <label>Buy price per card
+          <input className="input num" inputMode="numeric" value={price} onChange={e => setPrice(e.target.value.replace(/[^0-9]/g, ''))} aria-label="Buy price per card in stubs" />
+        </label>
+        <label>Copies (max {MAX_CARD_COPIES})
+          <input className="input num" inputMode="numeric" value={copies} onChange={e => setCopies(e.target.value.replace(/[^0-9]/g, ''))} aria-label="Number of copies" />
+        </label>
+      </div>
+      <div className="calc-out">
+        <div><div className="kv-value num">{Math.round(expectedQs).toLocaleString()}</div><div className="kv-label">Expected quicksell after update</div></div>
+        <div><div className={`kv-value num ${toneOf(perCard, 0.5)}`}>{stubs(perCard)}</div><div className="kv-label">Expected profit per card</div></div>
+        <div><div className={`kv-value num ${toneOf(perCard, 0.5)}`}>{stubs(perCard * n)}</div><div className="kv-label">Total for {n} {n === 1 ? 'copy' : 'copies'}</div></div>
+      </div>
+      <p className="note">Assumes you quicksell after the update. Selling on the market usually returns more than quicksell.</p>
+    </section>
+  )
+}
+
 export default function PlayerDrawer({ prediction: p, model, onClose }: {
   prediction: Prediction; model?: ModelSummary; onClose: () => void
 }) {
   const history = useHistory(p.card_uuid)
   const [edits, setEdits] = useState<Record<string, number>>({})
+  const closeRef = useRef<HTMLButtonElement>(null)
 
   useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null
+    closeRef.current?.focus()
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    return () => { window.removeEventListener('keydown', onKey); previous?.focus?.() }
   }, [onClose])
+
+  useEffect(() => { setEdits({}) }, [p.card_uuid])
 
   const attrs = useMemo(() => {
     const byName = Object.fromEntries((p.attributes ?? []).map(a => [a.attribute_name, a]))
@@ -66,6 +104,8 @@ export default function PlayerDrawer({ prediction: p, model, onClose }: {
   const none = Math.max(0, 1 - up - down)
   const ev = p.expected_value_per_card ?? 0
   const projected = Math.min(99, Math.round(p.current_ovr + p.predicted_ovr_delta))
+  const statGroup = p.stats?.group
+  const tierUp = p.tier_jump_probability >= p.tier_down_probability
 
   return (
     <>
@@ -73,7 +113,7 @@ export default function PlayerDrawer({ prediction: p, model, onClose }: {
       <aside className="drawer" role="dialog" aria-modal="true" aria-label={`${p.player_name} forecast`}>
         <div className="drawer-head">
           <span className="muted" style={{ fontSize: 13 }}>Player forecast</span>
-          <button className="icon-btn" style={{ marginLeft: 'auto' }} onClick={onClose} aria-label="Close">
+          <button ref={closeRef} className="icon-btn" style={{ marginLeft: 'auto' }} onClick={onClose} aria-label="Close">
             <Icon name="close" />
           </button>
         </div>
@@ -88,36 +128,32 @@ export default function PlayerDrawer({ prediction: p, model, onClose }: {
               </div>
               <div className="kv">
                 <div>
-                  <div className="kv-value num">
-                    {p.current_ovr} &rarr; {projected}
-                  </div>
+                  <div className="kv-value num">{p.current_ovr} &rarr; {projected}</div>
                   <div className="kv-label">
-                    OVR, expected change <span className={toneOf(p.predicted_ovr_delta, 0.25)}>{signed(p.predicted_ovr_delta)}</span>
+                    OVR, expected <span className={toneOf(p.predicted_ovr_delta, 0.25)}>{signed(p.predicted_ovr_delta)}</span>
                     {p.ovr_delta_sd != null && <> &plusmn;{p.ovr_delta_sd.toFixed(1)}</>}
                   </div>
                 </div>
                 <div>
                   <div className={`kv-value num ${toneOf(ev, 0.5)}`}>{stubs(ev)}</div>
-                  <div className="kv-label">Expected quicksell change / card</div>
+                  <div className="kv-label">Expected quicksell change</div>
                 </div>
                 <div>
                   <div className="kv-value num">{p.current_qs.toLocaleString()}</div>
                   <div className="kv-label">Quicksell now</div>
                 </div>
                 <div>
-                  <div className={`kv-value num ${p.tier_jump_probability >= 0.05 ? 'tier' : p.tier_down_probability >= 0.05 ? 'down' : ''}`}>
-                    {p.tier_jump_probability >= p.tier_down_probability ? pct(p.tier_jump_probability) : pct(p.tier_down_probability)}
+                  <div className={`kv-value num ${tierUp ? (p.tier_jump_probability >= 0.05 ? 'tier' : '') : 'down'}`}>
+                    {pct(tierUp ? p.tier_jump_probability : p.tier_down_probability)}
                   </div>
-                  <div className="kv-label">
-                    Chance of {p.tier_jump_probability >= p.tier_down_probability ? 'moving up' : 'dropping'} a rarity tier
-                  </div>
+                  <div className="kv-label">Chance of {tierUp ? 'moving up' : 'dropping'} a rarity tier</div>
                 </div>
               </div>
             </div>
           </section>
 
           <section>
-            <h3 className="section-title">Next attribute update</h3>
+            <h3>Next attribute update</h3>
             <div className="outcome" role="img" aria-label={`Up ${pct(up)}, no change ${pct(none)}, down ${pct(down)}`}>
               <span style={{ width: `${up * 100}%`, background: 'var(--up)' }} />
               <span style={{ width: `${none * 100}%`, background: 'var(--border-strong)' }} />
@@ -128,14 +164,36 @@ export default function PlayerDrawer({ prediction: p, model, onClose }: {
               <span>{pct(none)} no change</span>
               <span><span className="down">{pct(down)}</span> goes down</span>
             </div>
-            {!p.sample_size_ok && (
-              <p className="note" style={{ marginBottom: 0 }}>Little MLB playing time this season, so this forecast leans on rating history.</p>
-            )}
+            {!p.sample_size_ok && <p className="note">Little MLB playing time this season, so this forecast leans on rating history.</p>}
           </section>
+
+          {statGroup && (
+            <section>
+              <h3>2026 MLB stats</h3>
+              <div className="table-wrap">
+                <table className="grid compact">
+                  <thead>
+                    <tr>
+                      <th />
+                      {STAT_ROWS[statGroup].map(([k, label]) => <th key={k} className="r">{label}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {([['season', 'Season'], ['last30', 'Last 30 days'], ['last_season', '2025']] as const).map(([w, label]) => (
+                      <tr key={w}>
+                        <td className="muted">{label}</td>
+                        {STAT_ROWS[statGroup].map(([k]) => <td key={k} className="r num">{fmtStat(k, p.stats?.[w]?.[k])}</td>)}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
 
           {attrs.length > 0 && (
             <section>
-              <h3 className="section-title">Attributes</h3>
+              <h3>Attributes</h3>
               <div className="table-wrap">
                 <table className="grid compact">
                   <thead>
@@ -150,12 +208,10 @@ export default function PlayerDrawer({ prediction: p, model, onClose }: {
                   </thead>
                   <tbody>
                     {attrs.map(a => (
-                      <tr key={a.key} style={{ cursor: 'default' }}>
+                      <tr key={a.key}>
                         <td>{ATTR_LABELS[a.key] ?? a.key}</td>
                         <td className="r num">{a.rating_before}</td>
-                        <td className="r num muted">
-                          {a.stat_projection != null ? Math.round(a.stat_projection) : '—'}
-                        </td>
+                        <td className="r num muted">{a.stat_projection != null ? Math.round(a.stat_projection) : '—'}</td>
                         <td className={`r num delta ${toneOf(a.predicted_delta, 0.25)}`}>{signed(a.predicted_delta)}</td>
                         <td className="hide-sm">
                           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -166,7 +222,7 @@ export default function PlayerDrawer({ prediction: p, model, onClose }: {
                         {weights && (
                           <td className="r">
                             <input
-                              type="number" min={0} max={RATING_MAX}
+                              className="field-input" type="number" min={0} max={RATING_MAX}
                               aria-label={`${ATTR_LABELS[a.key]} scenario rating`}
                               value={edits[a.key] ?? a.projected_rating}
                               onChange={e => {
@@ -183,10 +239,7 @@ export default function PlayerDrawer({ prediction: p, model, onClose }: {
               </div>
               {scenario ? (
                 <p className="note" style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-                  <span>
-                    Scenario OVR: <strong className="num" style={{ color: 'var(--text)' }}>{scenario.ovr}</strong>{' '}
-                    (<span className={toneOf(scenario.delta, 0.25)}>{signed(scenario.delta)}</span>)
-                  </span>
+                  <span>Scenario OVR <strong className="num strong">{scenario.ovr}</strong> (<span className={toneOf(scenario.delta, 0.25)}>{signed(scenario.delta)}</span>)</span>
                   <button className="btn-link" onClick={() => setEdits({})}>Reset</button>
                 </p>
               ) : (
@@ -195,28 +248,25 @@ export default function PlayerDrawer({ prediction: p, model, onClose }: {
             </section>
           )}
 
+          <FlipCalculator key={p.card_uuid} p={p} />
+
           <section>
-            <h3 className="section-title">Recent roster updates</h3>
+            <h3>Recent roster updates</h3>
             {history === null ? (
               <p className="note">Loading&hellip;</p>
             ) : history.length === 0 ? (
               <p className="note">No changes recorded for this card this season.</p>
             ) : (
-              <div className="history">
+              <div>
                 {history.slice(0, 6).map(u => {
                   const d = u.ovr_before != null && u.ovr_after != null ? u.ovr_after - u.ovr_before : 0
                   return (
                     <div key={u.update_date} className="history-row">
                       <span className="muted">{shortDate(u.update_date)}</span>
-                      <span className="num">
-                        {u.ovr_before} &rarr; {u.ovr_after} {d !== 0 && <span className={toneOf(d)}>({signed(d, 0)})</span>}
-                      </span>
-                      <span className="history-changes">
+                      <span className="num">{u.ovr_before} &rarr; {u.ovr_after} {d !== 0 && <span className={toneOf(d)}>({signed(d, 0)})</span>}</span>
+                      <span className="muted">
                         {u.changes.map((c, i) => (
-                          <span key={i}>
-                            {i > 0 && ', '}
-                            {ATTR_LABELS[c.attribute] ?? c.attribute} <span className={`num ${toneOf(c.delta)}`}>{signed(c.delta, 0)}</span>
-                          </span>
+                          <span key={i}>{i > 0 && ', '}{ATTR_LABELS[c.attribute] ?? c.attribute} <span className={`num ${toneOf(c.delta)}`}>{signed(c.delta, 0)}</span></span>
                         ))}
                       </span>
                     </div>
@@ -225,11 +275,6 @@ export default function PlayerDrawer({ prediction: p, model, onClose }: {
               </div>
             )}
           </section>
-
-          <p className="note" style={{ margin: 0 }}>
-            Expected quicksell change is weighted over every possible OVR outcome and assumes buying at the
-            quicksell floor; &times;{MAX_CARD_COPIES} copies that's {stubs(ev * MAX_CARD_COPIES)} stubs.
-          </p>
         </div>
       </aside>
     </>

@@ -1,202 +1,84 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { fetchDashboard } from './api'
-import type { DashboardResponse, Prediction } from './types'
-import { RARITY_ORDER, pct, shortDate } from './types'
+import type { DashboardResponse } from './types'
 import TopBar from './components/TopBar'
-import PlayerTable, { type Sort, type SortKey } from './components/PlayerTable'
-import CardGrid from './components/CardGrid'
+import { ROUTES, type Route } from './routes'
 import PlayerDrawer from './components/PlayerDrawer'
-import Methodology from './components/Methodology'
-import { Icon, Segmented } from './components/ui'
+import Projections from './pages/Projections'
+import BuyLists from './pages/BuyLists'
+import PlayerStatsPage from './pages/PlayerStats'
+import TrackRecord from './pages/TrackRecord'
 
-type Tab = 'up' | 'down' | 'value' | 'all'
-type Group = 'all' | 'hitters' | 'pitchers'
-type Layout = 'table' | 'cards'
+function routeFromHash(): Route {
+  const r = location.hash.replace(/^#\/?/, '').split('?')[0]
+  return (ROUTES.find(x => x.id === r)?.id ?? 'projections') as Route
+}
 
-const PAGE_SIZE = 50
+/** ?player=<card uuid> in the hash opens that card, so a forecast can be shared as a link. */
+function playerFromHash(): string | null {
+  return new URLSearchParams(location.hash.split('?')[1] ?? '').get('player')
+}
 
-const TABS: { id: Tab; label: string; filter: (p: Prediction) => boolean; sort: Sort }[] = [
-  { id: 'up', label: 'Likely upgrades', filter: p => p.upgrade_probability >= 0.3, sort: { key: 'upgrade_probability', dir: 'desc' } },
-  { id: 'down', label: 'Likely downgrades', filter: p => p.downgrade_probability >= 0.3, sort: { key: 'downgrade_probability', dir: 'desc' } },
-  { id: 'value', label: 'Quicksell value', filter: p => (p.expected_value_per_card ?? 0) >= 1, sort: { key: 'expected_value_per_card', dir: 'desc' } },
-  { id: 'all', label: 'All cards', filter: () => true, sort: { key: 'current_ovr', dir: 'desc' } },
-]
-
-function compare(a: Prediction, b: Prediction, key: SortKey): number {
-  if (key === 'player_name') return a.player_name.localeCompare(b.player_name)
-  return (a[key] ?? 0) - (b[key] ?? 0)
+function setPlayerInHash(uuid: string | null) {
+  const [path] = location.hash.split('?')
+  const next = `${path || '#/'}${uuid ? `?player=${uuid}` : ''}`
+  if (next !== location.hash) history.replaceState(null, '', next)
 }
 
 export default function App() {
   const [data, setData] = useState<DashboardResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
-
-  const [tab, setTab] = useState<Tab>('up')
-  const [sort, setSort] = useState<Sort>(TABS[0].sort)
-  const [query, setQuery] = useState('')
-  const [group, setGroup] = useState<Group>('all')
-  const [rarity, setRarity] = useState('')
-  const [team, setTeam] = useState('')
-  const [layout, setLayout] = useState<Layout>('table')
-  const [page, setPage] = useState(0)
-  const [selected, setSelected] = useState<string | null>(null)
-  const [showMethod, setShowMethod] = useState(false)
+  const [route, setRoute] = useState<Route>(routeFromHash)
+  const [selected, setSelectedState] = useState<string | null>(playerFromHash)
+  const setSelected = useCallback((uuid: string | null) => { setSelectedState(uuid); setPlayerInHash(uuid) }, [])
 
   useEffect(() => {
     fetchDashboard().then(setData).catch(err => setError(err.message))
   }, [])
 
-  const predictions = useMemo(() => data?.predictions ?? [], [data])
-  const teams = useMemo(() => [...new Set(predictions.map(p => p.team).filter(Boolean) as string[])].sort(), [predictions])
+  useEffect(() => {
+    const onHash = () => { setRoute(routeFromHash()); setSelectedState(playerFromHash()); window.scrollTo(0, 0) }
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
 
-  // Everything except the tab filter, so tab counts reflect the other filters.
-  const base = useMemo(() => {
-    const q = query.trim().toLowerCase()
-    return predictions.filter(p =>
-      (!q || p.player_name.toLowerCase().includes(q) || (p.team ?? '').toLowerCase().includes(q)) &&
-      (group === 'all' || (group === 'hitters' ? !!p.is_hitter : !p.is_hitter)) &&
-      (!rarity || p.current_rarity === rarity) &&
-      (!team || p.team === team),
-    )
-  }, [predictions, query, group, rarity, team])
+  useEffect(() => {
+    const label = ROUTES.find(r => r.id === route)?.label
+    document.title = `${label} · Roster Forecast`
+  }, [route])
 
-  const counts = useMemo(() => Object.fromEntries(TABS.map(t => [t.id, base.filter(t.filter).length])) as Record<Tab, number>, [base])
+  const closeDrawer = useCallback(() => setSelected(null), [setSelected])
 
-  const rows = useMemo(() => {
-    const t = TABS.find(x => x.id === tab)!
-    const dir = sort.dir === 'asc' ? 1 : -1
-    return base.filter(t.filter).sort((a, b) => dir * compare(a, b, sort.key) || b.current_ovr - a.current_ovr)
-  }, [base, tab, sort])
+  const body = error ? (
+    <div className="state">
+      <strong className="strong">Forecasts didn't load</strong>
+      <span>{error}. Check that the API is running, then reload.</span>
+      <button className="btn" onClick={() => location.reload()}>Reload</button>
+    </div>
+  ) : !data ? (
+    <div className="state" aria-busy="true">Loading forecasts&hellip;</div>
+  ) : route === 'buy-lists' ? (
+    <BuyLists data={data} onSelect={setSelected} />
+  ) : route === 'stats' ? (
+    <PlayerStatsPage data={data} onSelect={setSelected} selected={selected} />
+  ) : route === 'track-record' ? (
+    <TrackRecord data={data} onSelect={setSelected} />
+  ) : (
+    <Projections data={data} onSelect={setSelected} selected={selected} />
+  )
 
-  useEffect(() => { setPage(0) }, [query, group, rarity, team, tab, sort])
-
-  const summary = useMemo(() => ({
-    up: predictions.filter(p => p.upgrade_probability >= 0.5).length,
-    down: predictions.filter(p => p.downgrade_probability >= 0.5).length,
-    tier: predictions.filter(p => p.tier_jump_probability >= 0.25).length,
-  }), [predictions])
-
-  const dataAsOf = useMemo(() => {
-    const t = Math.max(0, ...predictions.map(p => Date.parse(p.created_at) || 0))
-    return t ? new Date(t).toISOString() : null
-  }, [predictions])
-
-  const onTab = (t: Tab) => { setTab(t); setSort(TABS.find(x => x.id === t)!.sort) }
-  const onSort = (key: SortKey) =>
-    setSort(s => (s.key === key ? { key, dir: s.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: key === 'player_name' ? 'asc' : 'desc' }))
-  const closeDrawer = useCallback(() => setSelected(null), [])
-  const closeMethod = useCallback(() => setShowMethod(false), [])
-
-  if (error) {
-    return (
-      <div className="state">
-        <strong style={{ color: 'var(--text)' }}>Couldn't load forecasts</strong>
-        <span>{error}. Check that the API is running, then reload.</span>
-        <button className="btn" onClick={() => location.reload()}>Reload</button>
-      </div>
-    )
-  }
-  if (!data) return <div className="state">Loading forecasts&hellip;</div>
-
-  const pageRows = rows.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
-  const lastPage = Math.max(0, Math.ceil(rows.length / PAGE_SIZE) - 1)
-  const m = data.model?.metrics
-  const status = data.update_status
-  const selectedPrediction = predictions.find(p => p.card_uuid === selected)
+  const selectedPrediction = data?.predictions.find(p => p.card_uuid === selected)
 
   return (
     <>
-      <TopBar status={status} dataAsOf={dataAsOf} onMethodology={() => setShowMethod(true)} />
-
-      <main className="page">
-        <h1 className="page-title">Next attribute update forecast</h1>
-        <p className="page-lede">
-          Every Live Series card, scored on how its ratings are likely to move when San Diego Studio
-          next re-rates players{status.last_attribute_update ? ` (last update ${shortDate(status.last_attribute_update)})` : ''}.
-        </p>
-
-        <div className="summary">
-          <div className="summary-item">
-            <div className="summary-value num up">{summary.up}</div>
-            <div className="summary-label">cards 50%+ likely to upgrade</div>
-          </div>
-          <div className="summary-item">
-            <div className="summary-value num down">{summary.down}</div>
-            <div className="summary-label">cards 50%+ likely to downgrade</div>
-          </div>
-          <div className="summary-item">
-            <div className="summary-value num tier">{summary.tier}</div>
-            <div className="summary-label">cards 25%+ likely to jump a rarity tier</div>
-          </div>
-          {m && (
-            <div className="summary-item">
-              <div className="summary-value num">{pct(m.top25_up_hit_rate)}</div>
-              <div className="summary-label">
-                of top-25 upgrade picks went up in backtests{' '}
-                <button className="btn-link" onClick={() => setShowMethod(true)}>Details</button>
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="tabs" role="tablist" aria-label="Forecast views">
-          {TABS.map(t => (
-            <button key={t.id} role="tab" className="tab" aria-selected={tab === t.id} onClick={() => onTab(t.id)}>
-              {t.label}<span className="tab-count num">{counts[t.id].toLocaleString()}</span>
-            </button>
-          ))}
-        </div>
-
-        <div className="toolbar">
-          <label className="visually-hidden" htmlFor="search">Search players or teams</label>
-          <input id="search" className="input search" type="search" placeholder="Search players or teams"
-            value={query} onChange={e => setQuery(e.target.value)} />
-          <Segmented<Group> label="Player type" value={group} onChange={setGroup} options={[
-            { value: 'all', label: 'All' }, { value: 'hitters', label: 'Hitters' }, { value: 'pitchers', label: 'Pitchers' },
-          ]} />
-          <select className="select" aria-label="Rarity" value={rarity} onChange={e => setRarity(e.target.value)}>
-            <option value="">All rarities</option>
-            {RARITY_ORDER.slice().reverse().map(r => <option key={r} value={r}>{r}</option>)}
-          </select>
-          <select className="select" aria-label="Team" value={team} onChange={e => setTeam(e.target.value)}>
-            <option value="">All teams</option>
-            {teams.map(t => <option key={t} value={t}>{t}</option>)}
-          </select>
-          <span className="grow" />
-          <Segmented<Layout> label="Layout" value={layout} onChange={setLayout} options={[
-            { value: 'table', label: <Icon name="table" />, title: 'Table' },
-            { value: 'cards', label: <Icon name="cards" />, title: 'Cards' },
-          ]} />
-        </div>
-
-        {rows.length === 0 ? (
-          <div className="table-wrap empty">No cards match these filters.</div>
-        ) : layout === 'table' ? (
-          <PlayerTable rows={pageRows} sort={sort} onSort={onSort} selected={selected} onSelect={setSelected} />
-        ) : (
-          <CardGrid rows={pageRows} onSelect={setSelected} />
-        )}
-
-        {rows.length > PAGE_SIZE && (
-          <div className="pager">
-            <span className="num">
-              {(page * PAGE_SIZE + 1).toLocaleString()}&ndash;{Math.min(rows.length, (page + 1) * PAGE_SIZE).toLocaleString()} of {rows.length.toLocaleString()}
-            </span>
-            <div className="pager-buttons">
-              <button className="btn" disabled={page === 0} onClick={() => setPage(p => p - 1)}>Previous</button>
-              <button className="btn" disabled={page >= lastPage} onClick={() => setPage(p => p + 1)}>Next</button>
-            </div>
-          </div>
-        )}
-
-        <footer className="footer">
-          <span>Ratings and card art from The Show's public API. Stats from the MLB Stats API.</span>
-          <span>Fan project, not affiliated with San Diego Studio or MLB. Forecasts are estimates.</span>
-        </footer>
-      </main>
-
-      {selectedPrediction && <PlayerDrawer prediction={selectedPrediction} model={data.model} onClose={closeDrawer} />}
-      {showMethod && <Methodology model={data.model} onClose={closeMethod} />}
+      <a className="visually-hidden" href="#main">Skip to content</a>
+      <TopBar route={route} status={data?.update_status ?? null} />
+      <main id="main" className="page">{body}</main>
+      <footer className="footer">
+        <span>Ratings and card art from The Show's public API. Stats from the MLB Stats API.</span>
+        <span>Fan project, not affiliated with San Diego Studio or MLB. Forecasts are estimates, not guarantees.</span>
+      </footer>
+      {selectedPrediction && <PlayerDrawer prediction={selectedPrediction} model={data?.model} onClose={closeDrawer} />}
     </>
   )
 }

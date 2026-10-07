@@ -36,7 +36,7 @@ from sklearn.neighbors import KNeighborsRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from src.config import CORE_ATTRS, MODELS_DIR, PROCESSED_DIR, quicksell_value
+from src.config import CORE_ATTRS, MODELS_DIR, PROCESSED_DIR, STAT_CUTOFF_DAYS, quicksell_value
 from src.features.dataset import feature_columns
 from src.features.windows import HIT_RATES, PIT_RATES
 
@@ -372,10 +372,12 @@ def score_players(scored: pd.DataFrame, cals: dict[str, Calibration]) -> pd.Data
     return pd.concat(frames) if frames else pd.DataFrame()
 
 
-def walk_forward(data: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
+def walk_forward(data: pd.DataFrame) -> tuple[pd.DataFrame, list[dict], pd.DataFrame]:
+    """Returns (out-of-fold attribute rows, per-fold metrics, last fold's scored players)."""
     dates = sorted(data["as_of"].unique())
     oof_frames: list[pd.DataFrame] = []
     folds = []
+    players = pd.DataFrame()
     for k in range(1, len(dates)):
         train, test = data[data["as_of"] < dates[k]], data[data["as_of"] == dates[k]]
         prior_oof = pd.concat(oof_frames) if oof_frames else pd.DataFrame()
@@ -397,7 +399,38 @@ def walk_forward(data: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
             metrics["ovr_mae"], metrics["ovr_mae_baseline"], 100 * metrics["top25_up_hit_rate"],
         )
         oof_frames.append(pd.concat(fold_raw))
-    return pd.concat(oof_frames), folds
+    return pd.concat(oof_frames), folds, players
+
+
+def last_update_review(players: pd.DataFrame, data: pd.DataFrame, n: int = 25) -> dict:
+    """The backtest's picks for the most recent update next to what actually happened."""
+    if players.empty:
+        return {}
+    p = players.reset_index()
+    names = data.groupby("card_uuid")["player_name"].first()
+    p["player_name"] = p["card_uuid"].map(names)
+    p["realized_qs"] = p["ovr_after"].map(quicksell_value) - p["ovr_before"].map(quicksell_value)
+
+    def rows(frame: pd.DataFrame) -> list[dict]:
+        return [
+            {
+                "card_uuid": r.card_uuid, "player_name": r.player_name,
+                "ovr_before": int(r.ovr_before), "ovr_after": int(r.ovr_after),
+                "predicted_delta": round(float(r.mu), 2),
+                "upgrade_probability": round(float(r.upgrade_probability), 3),
+                "downgrade_probability": round(float(r.downgrade_probability), 3),
+                "expected_qs_change": round(float(r.expected_qs_change), 1),
+                "realized_qs_change": int(r.realized_qs),
+            }
+            for r in frame.itertuples()
+        ]
+
+    return {
+        "update": str(p["as_of"].iloc[0]),
+        "top_upgrades": rows(p.nlargest(n, "upgrade_probability")),
+        "top_downgrades": rows(p.nlargest(n, "downgrade_probability")),
+        "top_value": rows(p.nlargest(n, "expected_qs_change")),
+    }
 
 
 def summarize(folds: list[dict]) -> dict:
@@ -429,7 +462,7 @@ def train_all(data: pd.DataFrame | None = None) -> dict:
         raise ImportError("lightgbm is required for training")
 
     logger.info("Walk-forward backtest over %d updates...", data["as_of"].nunique())
-    oof, folds = walk_forward(data)
+    oof, folds, last_players = walk_forward(data)
 
     logger.info("Fitting final models on all %d rows...", len(data))
     groups, cals = {}, {}
@@ -452,6 +485,8 @@ def train_all(data: pd.DataFrame | None = None) -> dict:
         "summary": summarize(folds),
         "stacking_weights": {g: c.weights for g, c in cals.items()},
         "ovr_weights": {g: c.ovr_coef for g, c in cals.items()},
+        "stat_cutoff_days": int(data.attrs.get("lag_days", STAT_CUTOFF_DAYS)),
+        "last_update_review": last_update_review(last_players, data),
         "top_features": importances,
     }
 

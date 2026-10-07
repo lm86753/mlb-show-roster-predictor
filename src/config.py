@@ -148,6 +148,10 @@ CARD_FIELDS = {
 # update; the small weekly ones are injuries/role changes.
 MAJOR_UPDATE_MIN_CARDS = 100
 
+# Days before an attribute update that SDS's stat snapshot is taken. Chosen by
+# backtest (see scripts/tune_stat_cutoff.py); training stats stop here.
+STAT_CUTOFF_DAYS = 3
+
 # Live Series quicksell values by OVR (MLB The Show 26).
 _QS_BY_OVR = {
     75: 50, 76: 75, 77: 100, 78: 125, 79: 150,

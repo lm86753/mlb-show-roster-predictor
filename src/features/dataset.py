@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -21,7 +21,7 @@ import pandas as pd
 
 from src.config import (
     ATTR_GROUP, CARD_FIELDS, CORE_ATTRS, DB_PATH, MAJOR_UPDATE_MIN_CARDS,
-    PROCESSED_DIR, RAW_DIR,
+    PROCESSED_DIR, RAW_DIR, STAT_CUTOFF_DAYS,
 )
 from src.features.windows import HIT_RATES, PIT_RATES, load_game_log, prior_season_window, windows_as_of
 from src.models.registry import normalize_attr_name
@@ -157,13 +157,17 @@ def _ovr_lookup(changes: pd.DataFrame, as_of: str):
 class _StatCache:
     """Game logs + prior-season stats, memoized per player."""
 
-    def __init__(self, season: int, max_age_hours: float | None):
+    def __init__(self, season: int, max_age_hours: float | None, lag_days: int = 0):
         self.season = season
         self.max_age_hours = max_age_hours
+        # SDS rates players on stats frozen some days before an update ships.
+        self.lag_days = lag_days
         self._logs: dict = {}
         self._prev: dict = {}
 
     def windows(self, mlb_id, group: str, as_of: str) -> dict:
+        if self.lag_days:
+            as_of = (datetime.strptime(as_of[:10], "%Y-%m-%d").date() - timedelta(days=self.lag_days)).isoformat()
         if mlb_id is None or pd.isna(mlb_id):
             return windows_as_of([], as_of, group)
         k = (int(mlb_id), group)
@@ -256,7 +260,9 @@ def build_rows(
     return df
 
 
-def build_training_dataset(game_year: int = 26, save: bool = True, refresh_hours: float | None = 20) -> pd.DataFrame:
+def build_training_dataset(
+    game_year: int = 26, save: bool = True, refresh_hours: float | None = 20, lag_days: int = STAT_CUTOFF_DAYS,
+) -> pd.DataFrame:
     changes = load_changes(game_year)
     cards = load_cards(game_year)
     if cards.empty:
@@ -266,8 +272,8 @@ def build_training_dataset(game_year: int = 26, save: bool = True, refresh_hours
     season = 2000 + game_year
     # Logs cached mid-season would be missing later games, so refresh stale ones.
     refresh_game_logs(cards, changes, season, refresh_hours)
-    stats = _StatCache(season, max_age_hours=None)
-    logger.info("Major attribute updates: %s", ", ".join(majors))
+    stats = _StatCache(season, max_age_hours=None, lag_days=lag_days)
+    logger.info("Major attribute updates: %s (stats cut off %d days before each)", ", ".join(majors), lag_days)
 
     # A card added mid-season isn't a "no change" example for earlier updates.
     first_seen = changes.groupby("card_uuid")["update_date"].min()
@@ -285,6 +291,7 @@ def build_training_dataset(game_year: int = 26, save: bool = True, refresh_hours
         frames.append(df)
 
     data = pd.concat(frames, ignore_index=True)
+    data.attrs["lag_days"] = lag_days
     if save:
         PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
         data.to_parquet(PROCESSED_DIR / "training_examples.parquet", index=False)

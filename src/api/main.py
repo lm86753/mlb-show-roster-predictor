@@ -61,6 +61,8 @@ def _model_summary() -> dict:
         "metrics": s.get("summary", {}),
         "folds": s.get("folds", []),
         "ovr_weights": s.get("ovr_weights", {}),
+        "stat_cutoff_days": s.get("stat_cutoff_days"),
+        "last_update_review": s.get("last_update_review", {}),
     }
 
 
@@ -103,6 +105,7 @@ def _serialize(p: Prediction, snap: CardSnapshot | None = None, with_attrs: bool
         })
     if with_attrs:
         out["attributes"] = json.loads(p.attributes_json or "[]")
+        out["stats"] = json.loads(p.stats_json or "{}")
     return out
 
 
