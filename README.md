@@ -35,15 +35,17 @@ Averaged over the Jul 16 – Oct 2 updates, each predicted using only earlier da
 
 | | Model | Baseline |
 |---|---|---|
-| Top-25 predicted upgrades that went up | 90% (avg +3.9 OVR) | 15% base rate |
-| Top-25 predicted downgrades that went down | 80% | 11% base rate |
-| Realized QS gain/card, top-25 expected-value picks | +780 stubs | +3 (average card) |
+| Top-25 predicted upgrades that went up | 93% (avg +3.9 OVR) | 15% base rate |
+| Top-25 predicted downgrades that went down | 81% | 11% base rate |
+| Realized QS gain/card, top-25 expected-value picks | +796 stubs | +3 (average card) |
 | Upgrade-probability Brier score | 0.076 | 0.126 |
 | Attribute direction (when it moved, model called ≥0.5) | 78% | — |
-| 80% attribute intervals containing the outcome | 83% | — |
+| 80% attribute intervals containing the outcome | 84% | — |
 
-Full per-update results are in `data/models/backtest_summary.json` and the dashboard's
-"Model track record" panel.
+Training and backtest stats are cut off 3 days before each update ships, which is when SDS
+appears to freeze the numbers it rates on (`scripts/tune_stat_cutoff.py` sweeps the cutoff and
+runs a shuffled-outcome leakage check). Full per-update results are in
+`data/models/backtest_summary.json` and the dashboard's Track Record page.
 
 ## Quick start
 
@@ -73,8 +75,8 @@ src/ingest/     SDS roster updates + cards, MLB Stats API client
 src/features/   windows.py (point-in-time stat windows), dataset.py (train/live rows)
 src/models/     train.py (models + walk-forward backtest), predict.py (live scoring)
 src/api/        FastAPI: /dashboard, /player/{uuid}, /player-history/{uuid}, /accuracy
-web/            React + Vite dashboard (table + card views, player drawer, methodology)
-scripts/        daily_predict.py, train.py, exports
+web/            React + Vite dashboard (Projections, Buy Lists, Player Stats, Track Record, player drawer)
+scripts/        daily_predict.py, train.py, tune_stat_cutoff.py, exports
 ```
 
 ## Limitations
