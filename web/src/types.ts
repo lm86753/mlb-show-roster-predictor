@@ -36,6 +36,28 @@ export interface Prediction {
   created_at: string
   /** Probability-weighted quicksell change per card (stubs) */
   expected_value_per_card: number | null
+  stats?: PlayerStats
+}
+
+export type StatLine = Record<string, number | null>
+
+export interface PlayerStats {
+  group?: 'hitting' | 'pitching'
+  season?: StatLine
+  last30?: StatLine
+  last_season?: StatLine
+}
+
+export interface ReviewPick {
+  card_uuid: string
+  player_name: string
+  ovr_before: number
+  ovr_after: number
+  predicted_delta: number
+  upgrade_probability: number
+  downgrade_probability: number
+  expected_qs_change: number
+  realized_qs_change: number
 }
 
 export interface UpdateStatus {
@@ -49,6 +71,7 @@ export interface UpdateStatus {
 }
 
 export interface BacktestMetrics {
+  ovr_spearman: number
   attr_direction_acc: number
   interval_coverage: number
   upgrade_brier: number
@@ -73,6 +96,13 @@ export interface ModelSummary {
   metrics?: BacktestMetrics
   folds?: BacktestFold[]
   ovr_weights?: Record<'hitting' | 'pitching', Record<string, number>>
+  stat_cutoff_days?: number
+  last_update_review?: {
+    update?: string
+    top_upgrades?: ReviewPick[]
+    top_downgrades?: ReviewPick[]
+    top_value?: ReviewPick[]
+  }
 }
 
 export interface DashboardResponse {
@@ -151,4 +181,14 @@ export function shortDate(iso: string | null | undefined): string {
   if (!iso) return '—'
   const d = new Date(`${iso.slice(0, 10)}T12:00:00`)
   return isNaN(d.getTime()) ? iso : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
+/** Batting/pitching rates: .xxx for slash stats, % for rates, 2dp for ERA/WHIP. */
+export function fmtStat(key: string, v: number | null | undefined): string {
+  if (v == null || isNaN(v)) return '—'
+  if (key === 'pa' || key === 'bf') return Math.round(v).toLocaleString()
+  if (['avg', 'obp', 'slg', 'iso'].includes(key)) return v.toFixed(3).replace(/^0/, '')
+  if (key.endsWith('_pct')) return `${(v * 100).toFixed(1)}%`
+  if (key === 'ip_per_g') return v.toFixed(1)
+  return v.toFixed(2)
 }

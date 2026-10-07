@@ -127,6 +127,7 @@ class Prediction(Base):
     tier_jump_probability = Column(Float)
     tier_down_probability = Column(Float, default=0.0)
     ovr_delta_sd = Column(Float)
+    stats_json = Column(Text)
     sample_size_ok = Column(Integer, default=1)
     horizon_days = Column(Integer, default=1)
     attributes_json = Column(Text)
@@ -170,6 +171,7 @@ def _migrate_predictions_columns(engine) -> None:
         ("roi_pct", sa.Float),
         ("tier_down_probability", sa.Float),
         ("ovr_delta_sd", sa.Float),
+        ("stats_json", sa.Text),
     ]
     with engine.connect() as conn:
         try:
