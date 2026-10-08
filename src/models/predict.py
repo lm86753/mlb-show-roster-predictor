@@ -64,6 +64,30 @@ def predict_live(live: pd.DataFrame, model: dict | None = None) -> tuple[pd.Data
     return attrs, players.sort_values("expected_qs_change", ascending=False)
 
 
+# Real MLB stats shown beside each card (season to date and the last 30 days).
+DISPLAY_STATS = {
+    "hitting": ["pa", "avg", "obp", "slg", "iso", "k_pct", "bb_pct", "hr_pct"],
+    "pitching": ["bf", "era", "whip", "k_pct", "bb_pct", "hr_pct", "ip_per_g"],
+}
+
+
+def stat_records(live: pd.DataFrame) -> dict[str, dict]:
+    """card_uuid -> {"group", "season": {...}, "last30": {...}} from the card's own stat group."""
+    out: dict[str, dict] = {}
+    # to_dict, not itertuples: itertuples renames columns that start with a digit ("30d_pa").
+    for row in live.drop_duplicates(["card_uuid", "group"]).to_dict("records"):
+        group = "pitching" if row["is_pitcher_card"] else "hitting"
+        if row["group"] != group:
+            continue
+
+        def pick(window: str) -> dict:
+            vals = {k: row.get(f"{window}_{k}") for k in DISPLAY_STATS[group]}
+            return {k: (None if v is None or pd.isna(v) else round(float(v), 4)) for k, v in vals.items()}
+
+        out[row["card_uuid"]] = {"group": group, "season": pick("ytd"), "last30": pick("30d"), "last_season": pick("prev")}
+    return out
+
+
 def attribute_records(attrs: pd.DataFrame, card_uuid: str) -> list[dict]:
     sub = attrs[attrs["card_uuid"] == card_uuid]
     out = []
@@ -88,6 +112,7 @@ def attribute_records(attrs: pd.DataFrame, card_uuid: str) -> list[dict]:
 
 def run_predictions(live: pd.DataFrame, persist: bool = True) -> pd.DataFrame:
     attrs, players = predict_live(live)
+    stats = stat_records(live)
     if persist and not players.empty:
         Session = init_db()
         with Session() as session:
@@ -105,9 +130,13 @@ def run_predictions(live: pd.DataFrame, persist: bool = True) -> pd.DataFrame:
                     downgrade_probability=round(float(p.downgrade_probability), 4),
                     tier_jump_probability=round(float(p.tier_up_probability), 4),
                     tier_down_probability=round(float(p.tier_down_probability), 4),
+                    gold_probability=round(float(p.gold_probability), 4),
+                    diamond_probability=round(float(p.diamond_probability), 4),
+                    ovr_move_probs_json=dumps([round(float(x), 4) for x in p.move_probs]),
                     sample_size_ok=int(bool(p.sample_size_ok)),
                     horizon_days=1,
                     attributes_json=dumps(attribute_records(attrs, p.card_uuid)),
+                    stats_json=dumps(stats.get(p.card_uuid, {})),
                     avg_gap=None if pd.isna(p.avg_gap) else round(float(p.avg_gap), 2),
                     direction_consensus=round(float(p.direction_consensus), 4),
                     investment_score=round(100 * float(p.direction_consensus), 1),

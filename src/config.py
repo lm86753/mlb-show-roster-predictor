@@ -27,13 +27,12 @@ MLB_STATS_API = "https://statsapi.mlb.com/api/v1"
 RARITY_TIERS = {
     "Common": (0, 64),
     "Bronze": (65, 74),
-    "Silver": (75, 84),
-    "Gold": (85, 89),
-    "Diamond": (90, 94),
-    "Red Diamond": (95, 99),
+    "Silver": (75, 79),
+    "Gold": (80, 84),
+    "Diamond": (85, 99),
 }
 
-TIER_ORDER = ["Common", "Bronze", "Silver", "Gold", "Diamond", "Red Diamond"]
+TIER_ORDER = ["Common", "Bronze", "Silver", "Gold", "Diamond"]
 
 # ── SDS API label → canonical name ──────────────────────────────────────────
 # FIXED: K/9 → k_per_9 (was incorrectly bb_per_bf)
@@ -147,6 +146,10 @@ CARD_FIELDS = {
 # An update that touches at least this many cards is a monthly attribute
 # update; the small weekly ones are injuries/role changes.
 MAJOR_UPDATE_MIN_CARDS = 100
+
+# Days before an attribute update that SDS's stat snapshot is taken. Chosen by
+# backtest (see scripts/tune_stat_cutoff.py); training stats stop here.
+STAT_CUTOFF_DAYS = 3
 
 # Live Series quicksell values by OVR (MLB The Show 26).
 _QS_BY_OVR = {

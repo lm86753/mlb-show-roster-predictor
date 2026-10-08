@@ -28,6 +28,12 @@ export interface Prediction {
   downgrade_probability: number
   tier_jump_probability: number
   tier_down_probability: number
+  /** Chance the card is Gold (80+) after the update */
+  gold_probability?: number
+  /** Chance the card is Diamond (85+) after the update */
+  diamond_probability?: number
+  /** P(OVR moves by k) for k = −4…+4 */
+  ovr_move_probs?: number[]
   sample_size_ok: boolean
   team: string | null
   position: string | null
@@ -36,6 +42,29 @@ export interface Prediction {
   created_at: string
   /** Probability-weighted quicksell change per card (stubs) */
   expected_value_per_card: number | null
+  stats?: PlayerStats
+}
+
+export type StatLine = Record<string, number | null>
+
+export interface PlayerStats {
+  group?: 'hitting' | 'pitching'
+  season?: StatLine
+  last30?: StatLine
+  last_season?: StatLine
+}
+
+export interface ReviewPick {
+  card_uuid: string
+  player_name: string
+  ovr_before: number
+  ovr_after: number
+  predicted_delta: number
+  upgrade_probability: number
+  downgrade_probability: number
+  expected_qs_change: number
+  gold_probability?: number
+  realized_qs_change: number
 }
 
 export interface UpdateStatus {
@@ -49,6 +78,7 @@ export interface UpdateStatus {
 }
 
 export interface BacktestMetrics {
+  ovr_spearman: number
   attr_direction_acc: number
   interval_coverage: number
   upgrade_brier: number
@@ -61,6 +91,51 @@ export interface BacktestMetrics {
   top25_down_hit_rate: number
   top25_ev_avg_qs_gain: number
   all_avg_qs_gain: number
+  ovr_mae?: number
+  downgrade_prob_mean?: number
+  ovr_mae_baseline?: number
+  downgrade_brier?: number
+  downgrade_brier_baseline?: number
+  tier_up_brier?: number
+  tier_up_brier_baseline?: number
+  tier_up_prob_mean?: number
+  base_rate_tier_up?: number
+  /** Share of OVR changes inside the card's 80% range */
+  ovr_interval_coverage?: number
+  qs_ev_mae?: number
+  qs_ev_mae_baseline?: number
+  qs_ev_spearman?: number | null
+  s2g_n?: number
+  s2g_base_rate?: number
+  s2g_prob_mean?: number
+  s2g_brier?: number
+  s2g_brier_baseline?: number
+  /** Share of the top 10 Silver → Gold picks that reached Gold */
+  s2g_top_hit_rate?: number
+  s2g_top_avg_qs_gain?: number
+}
+
+/** Backtest accuracy for one predicted attribute, pooled over calibrated updates. */
+export interface AttributeAccuracy {
+  group: 'hitting' | 'pitching'
+  n: number
+  attr_mae: number
+  attr_mae_baseline: number
+  attr_skill: number
+  attr_spearman: number
+  attr_direction_acc: number | null
+  interval_coverage: number
+  moved_rate: number
+  bias: number
+}
+
+/** Forecast-probability bucket vs how often the event happened. */
+export interface ReliabilityRow {
+  lo: number
+  hi: number
+  forecast: number
+  actual: number
+  n: number
 }
 
 export interface BacktestFold extends Partial<BacktestMetrics> {
@@ -73,6 +148,16 @@ export interface ModelSummary {
   metrics?: BacktestMetrics
   folds?: BacktestFold[]
   ovr_weights?: Record<'hitting' | 'pitching', Record<string, number>>
+  stat_cutoff_days?: number
+  last_update_review?: {
+    update?: string
+    top_upgrades?: ReviewPick[]
+    top_downgrades?: ReviewPick[]
+    top_value?: ReviewPick[]
+    silver_to_gold?: ReviewPick[]
+  }
+  by_attribute?: Record<string, AttributeAccuracy>
+  calibration?: Partial<Record<'upgrade' | 'downgrade' | 'tier_up' | 'silver_to_gold', ReliabilityRow[]>>
 }
 
 export interface DashboardResponse {
@@ -151,4 +236,14 @@ export function shortDate(iso: string | null | undefined): string {
   if (!iso) return '—'
   const d = new Date(`${iso.slice(0, 10)}T12:00:00`)
   return isNaN(d.getTime()) ? iso : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
+/** Batting/pitching rates: .xxx for slash stats, % for rates, 2dp for ERA/WHIP. */
+export function fmtStat(key: string, v: number | null | undefined): string {
+  if (v == null || isNaN(v)) return '—'
+  if (key === 'pa' || key === 'bf') return Math.round(v).toLocaleString()
+  if (['avg', 'obp', 'slg', 'iso'].includes(key)) return v.toFixed(3).replace(/^0/, '')
+  if (key.endsWith('_pct')) return `${(v * 100).toFixed(1)}%`
+  if (key === 'ip_per_g') return v.toFixed(1)
+  return v.toFixed(2)
 }
