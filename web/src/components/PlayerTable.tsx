@@ -39,7 +39,7 @@ function TierCell({ p }: { p: Prediction }) {
 export default function PlayerTable({ rows, sort, onSort, selected, onSelect }: Props) {
   return (
     <div className="table-wrap">
-      <table className="grid">
+      <table className="grid clickable">
         <thead>
           <tr>
             <Header label="Player" k="player_name" sort={sort} onSort={onSort} />

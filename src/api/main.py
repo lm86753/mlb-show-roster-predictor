@@ -61,6 +61,10 @@ def _model_summary() -> dict:
         "metrics": s.get("summary", {}),
         "folds": s.get("folds", []),
         "ovr_weights": s.get("ovr_weights", {}),
+        "stat_cutoff_days": s.get("stat_cutoff_days"),
+        "last_update_review": s.get("last_update_review", {}),
+        "by_attribute": s.get("by_attribute", {}),
+        "calibration": s.get("calibration", {}),
     }
 
 
@@ -87,6 +91,10 @@ def _serialize(p: Prediction, snap: CardSnapshot | None = None, with_attrs: bool
         "downgrade_probability": p.downgrade_probability or 0.0,
         "tier_jump_probability": p.tier_jump_probability or 0.0,
         "tier_down_probability": p.tier_down_probability or 0.0,
+        "gold_probability": p.gold_probability or 0.0,
+        "diamond_probability": p.diamond_probability or 0.0,
+        # P(OVR moves by k) for k in -4..+4; drives the profit calculator.
+        "ovr_move_probs": json.loads(p.ovr_move_probs_json or "[]"),
         "sample_size_ok": bool(p.sample_size_ok),
         "avg_gap": p.avg_gap,
         "direction_consensus": p.direction_consensus,
@@ -103,6 +111,7 @@ def _serialize(p: Prediction, snap: CardSnapshot | None = None, with_attrs: bool
         })
     if with_attrs:
         out["attributes"] = json.loads(p.attributes_json or "[]")
+        out["stats"] = json.loads(p.stats_json or "{}")
     return out
 
 

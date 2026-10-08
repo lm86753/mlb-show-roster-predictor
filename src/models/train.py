@@ -36,7 +36,7 @@ from sklearn.neighbors import KNeighborsRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from src.config import CORE_ATTRS, MODELS_DIR, PROCESSED_DIR, quicksell_value
+from src.config import CORE_ATTRS, MODELS_DIR, PROCESSED_DIR, STAT_CUTOFF_DAYS, quicksell_value
 from src.features.dataset import feature_columns
 from src.features.windows import HIT_RATES, PIT_RATES
 
@@ -52,6 +52,9 @@ SUMMARY_PATH = MODELS_DIR / "backtest_summary.json"
 SIGNALS = ["s_gap", "s_gbm", "s_analog"]
 INTERVAL_Q = (0.1, 0.9)  # 80% prediction interval
 OVR_MOVES = list(range(-4, 5))  # integer OVR moves; tails clipped to ±4
+# Live Series rarity floors: Bronze 65, Silver 75, Gold 80, Diamond 85.
+TIER_FLOORS = np.array([65, 75, 80, 85])
+SILVER_FLOOR, GOLD_FLOOR, DIAMOND_FLOOR = 75, 80, 85
 
 
 def _projector_cols(group: str) -> list[str]:
@@ -283,9 +286,8 @@ def player_market_metrics(ovr: np.ndarray, probs: np.ndarray) -> pd.DataFrame:
     new_ovr = (ovr[:, None] + moves[None, :]).clip(40, 99)
     qs_now = np.array([quicksell_value(int(o)) for o in ovr])
     qs_new = np.vectorize(quicksell_value)(new_ovr)
-    tiers = np.array([65, 75, 85, 90])  # Bronze/Silver/Gold/Diamond floors
-    tier_now = np.searchsorted(tiers, ovr, side="right")
-    tier_new = np.searchsorted(tiers, new_ovr, side="right")
+    tier_now = np.searchsorted(TIER_FLOORS, ovr, side="right")
+    tier_new = np.searchsorted(TIER_FLOORS, new_ovr, side="right")
     return pd.DataFrame({
         "upgrade_probability": (probs * (moves > 0)).sum(axis=1),
         "downgrade_probability": (probs * (moves < 0)).sum(axis=1),
@@ -297,7 +299,21 @@ def player_market_metrics(ovr: np.ndarray, probs: np.ndarray) -> pd.DataFrame:
         "expected_move": expected,
         "sd": np.sqrt((probs * (moves[None, :] - expected[:, None]) ** 2).sum(axis=1)),
         "p_no_change": probs[:, OVR_MOVES.index(0)],
+        # Chance the card is Gold / Diamond after the update (the Silver -> Gold estimate).
+        "gold_probability": (probs * (new_ovr >= GOLD_FLOOR)).sum(axis=1),
+        "diamond_probability": (probs * (new_ovr >= DIAMOND_FLOOR)).sum(axis=1),
+        "move_probs": list(np.round(probs, 4)),
     })
+
+
+def _move_quantile(probs: np.ndarray, q: float) -> np.ndarray:
+    """Integer OVR move at the q-th quantile of each row's distribution."""
+    cdf = np.cumsum(probs, axis=1)
+    return np.array(OVR_MOVES)[(cdf < q - 1e-9).sum(axis=1).clip(0, len(OVR_MOVES) - 1)]
+
+
+def _is_silver(ovr: pd.Series) -> pd.Series:
+    return (ovr >= SILVER_FLOOR) & (ovr < GOLD_FLOOR)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -331,7 +347,12 @@ def _player_metrics(players: pd.DataFrame) -> dict:
     top_dn = players.nsmallest(25, "mu")
     top_ev = players.nlargest(25, "expected_qs_change")
     realized_qs = players["ovr_after"].map(quicksell_value) - players["ovr_before"].map(quicksell_value)
-    return {
+    down = (y < 0).astype(float)
+    tier_up = _tier_up(players)
+    probs = np.vstack(players["move_probs"].to_numpy())
+    lo, hi = _move_quantile(probs, INTERVAL_Q[0]), _move_quantile(probs, INTERVAL_Q[1])
+    ev = players["expected_qs_change"]
+    out = {
         "ovr_mae": float((y - mu).abs().mean()),
         "ovr_mae_baseline": float(y.abs().mean()),
         "ovr_spearman": float(spearmanr(y, mu).correlation),
@@ -347,6 +368,86 @@ def _player_metrics(players: pd.DataFrame) -> dict:
         "base_rate_up": float((y > 0).mean()),
         "base_rate_down": float((y < 0).mean()),
         "n_players": int(len(players)),
+        "downgrade_brier": float(((players["downgrade_probability"] - down) ** 2).mean()),
+        "downgrade_brier_baseline": float(((down.mean() - down) ** 2).mean()),
+        "tier_up_brier": float(((players["tier_up_probability"] - tier_up) ** 2).mean()),
+        "tier_up_brier_baseline": float(((tier_up.mean() - tier_up) ** 2).mean()),
+        "tier_up_prob_mean": float(players["tier_up_probability"].mean()),
+        "base_rate_tier_up": float(tier_up.mean()),
+        "ovr_interval_coverage": float(((y >= lo) & (y <= hi)).mean()),
+        "qs_ev_mae": float((ev - realized_qs).abs().mean()),
+        "qs_ev_mae_baseline": float(realized_qs.abs().mean()),
+        "qs_ev_spearman": float(spearmanr(ev, realized_qs).correlation) if ev.std() > 0 else None,
+    }
+    out.update(_silver_to_gold_metrics(players, realized_qs))
+    return out
+
+
+def _tier_up(players: pd.DataFrame) -> pd.Series:
+    after = np.searchsorted(TIER_FLOORS, players["ovr_after"], side="right")
+    before = np.searchsorted(TIER_FLOORS, players["ovr_before"], side="right")
+    return pd.Series((after > before).astype(float), index=players.index)
+
+
+S2G_TOP_N = 10
+
+
+def _silver_to_gold_metrics(players: pd.DataFrame, realized_qs: pd.Series) -> dict:
+    """How well P(a Silver card is Gold after the update) held up."""
+    silver = players[_is_silver(players["ovr_before"])]
+    if silver.empty:
+        return {"s2g_n": 0}
+    hit = (silver["ovr_after"] >= GOLD_FLOOR).astype(float)
+    top = silver.nlargest(S2G_TOP_N, "gold_probability")
+    return {
+        "s2g_n": int(len(silver)),
+        "s2g_base_rate": float(hit.mean()),
+        "s2g_prob_mean": float(silver["gold_probability"].mean()),
+        "s2g_brier": float(((silver["gold_probability"] - hit) ** 2).mean()),
+        "s2g_brier_baseline": float(((hit.mean() - hit) ** 2).mean()),
+        "s2g_top_hit_rate": float(hit.loc[top.index].mean()),
+        # Bought at the quicksell floor before the update, quicksold after it.
+        "s2g_top_avg_qs_gain": float(realized_qs.loc[top.index].mean()),
+    }
+
+
+def by_attribute_metrics(scored: pd.DataFrame) -> dict:
+    """Backtest accuracy for every predicted attribute, pooled over calibrated folds."""
+    out = {}
+    for (group, attr), sub in scored.groupby(["group", "attr"]):
+        out[attr] = _attr_metrics(sub) | {
+            "group": group,
+            "n": int(len(sub)),
+            "moved_rate": float((sub["delta"] != 0).mean()),
+            "bias": float((sub["ens"] - sub["delta"]).mean()),
+        }
+    return out
+
+
+RELIABILITY_BINS = [0, 0.05, 0.15, 0.3, 0.5, 0.7, 0.85, 1.0001]
+
+
+def reliability_table(probs: pd.Series, happened: pd.Series) -> list[dict]:
+    """Forecast-probability buckets against how often the event actually happened."""
+    rows = []
+    for interval, idx in probs.groupby(pd.cut(probs, RELIABILITY_BINS, right=False), observed=True).groups.items():
+        if len(idx):
+            rows.append({
+                "lo": float(interval.left), "hi": float(min(interval.right, 1.0)),
+                "forecast": float(probs.loc[idx].mean()), "actual": float(happened.loc[idx].mean()),
+                "n": int(len(idx)),
+            })
+    return rows
+
+
+def calibration_report(players: pd.DataFrame) -> dict:
+    y = players["ovr_after"] - players["ovr_before"]
+    silver = players[_is_silver(players["ovr_before"])]
+    return {
+        "upgrade": reliability_table(players["upgrade_probability"], (y > 0).astype(float)),
+        "downgrade": reliability_table(players["downgrade_probability"], (y < 0).astype(float)),
+        "tier_up": reliability_table(players["tier_up_probability"], _tier_up(players)),
+        "silver_to_gold": reliability_table(silver["gold_probability"], (silver["ovr_after"] >= GOLD_FLOOR).astype(float)),
     }
 
 
@@ -372,10 +473,15 @@ def score_players(scored: pd.DataFrame, cals: dict[str, Calibration]) -> pd.Data
     return pd.concat(frames) if frames else pd.DataFrame()
 
 
-def walk_forward(data: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
+def walk_forward(data: pd.DataFrame) -> tuple[pd.DataFrame, list[dict], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Returns (out-of-fold attribute rows, per-fold metrics, last fold's scored players,
+    and the scored attribute rows / players pooled over every calibrated fold)."""
     dates = sorted(data["as_of"].unique())
     oof_frames: list[pd.DataFrame] = []
     folds = []
+    players = pd.DataFrame()
+    scored_pool: list[pd.DataFrame] = []
+    player_pool: list[pd.DataFrame] = []
     for k in range(1, len(dates)):
         train, test = data[data["as_of"] < dates[k]], data[data["as_of"] == dates[k]]
         prior_oof = pd.concat(oof_frames) if oof_frames else pd.DataFrame()
@@ -397,7 +503,48 @@ def walk_forward(data: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
             metrics["ovr_mae"], metrics["ovr_mae_baseline"], 100 * metrics["top25_up_hit_rate"],
         )
         oof_frames.append(pd.concat(fold_raw))
-    return pd.concat(oof_frames), folds
+        if k > 1:  # the first fold has no earlier out-of-fold data to calibrate on
+            scored_pool.append(scored)
+            player_pool.append(players)
+
+    def pool(frames: list[pd.DataFrame]) -> pd.DataFrame:
+        return pd.concat(frames) if frames else pd.DataFrame()
+
+    return pd.concat(oof_frames), folds, players, pool(scored_pool), pool(player_pool)
+
+
+def last_update_review(players: pd.DataFrame, data: pd.DataFrame, n: int = 25) -> dict:
+    """The backtest's picks for the most recent update next to what actually happened."""
+    if players.empty:
+        return {}
+    p = players.reset_index()
+    names = data.groupby("card_uuid")["player_name"].first()
+    p["player_name"] = p["card_uuid"].map(names)
+    p["realized_qs"] = p["ovr_after"].map(quicksell_value) - p["ovr_before"].map(quicksell_value)
+
+    def rows(frame: pd.DataFrame) -> list[dict]:
+        return [
+            {
+                "card_uuid": r.card_uuid, "player_name": r.player_name,
+                "ovr_before": int(r.ovr_before), "ovr_after": int(r.ovr_after),
+                "predicted_delta": round(float(r.mu), 2),
+                "upgrade_probability": round(float(r.upgrade_probability), 3),
+                "downgrade_probability": round(float(r.downgrade_probability), 3),
+                "expected_qs_change": round(float(r.expected_qs_change), 1),
+                "gold_probability": round(float(r.gold_probability), 3),
+                "realized_qs_change": int(r.realized_qs),
+            }
+            for r in frame.itertuples()
+        ]
+
+    silver = p[_is_silver(p["ovr_before"])]
+    return {
+        "update": str(p["as_of"].iloc[0]),
+        "top_upgrades": rows(p.nlargest(n, "upgrade_probability")),
+        "top_downgrades": rows(p.nlargest(n, "downgrade_probability")),
+        "top_value": rows(p.nlargest(n, "expected_qs_change")),
+        "silver_to_gold": rows(silver.nlargest(n, "gold_probability")),
+    }
 
 
 def summarize(folds: list[dict]) -> dict:
@@ -429,7 +576,7 @@ def train_all(data: pd.DataFrame | None = None) -> dict:
         raise ImportError("lightgbm is required for training")
 
     logger.info("Walk-forward backtest over %d updates...", data["as_of"].nunique())
-    oof, folds = walk_forward(data)
+    oof, folds, last_players, scored_pool, player_pool = walk_forward(data)
 
     logger.info("Fitting final models on all %d rows...", len(data))
     groups, cals = {}, {}
@@ -452,6 +599,10 @@ def train_all(data: pd.DataFrame | None = None) -> dict:
         "summary": summarize(folds),
         "stacking_weights": {g: c.weights for g, c in cals.items()},
         "ovr_weights": {g: c.ovr_coef for g, c in cals.items()},
+        "stat_cutoff_days": int(data.attrs.get("lag_days", STAT_CUTOFF_DAYS)),
+        "last_update_review": last_update_review(last_players, data),
+        "by_attribute": by_attribute_metrics(scored_pool) if len(scored_pool) else {},
+        "calibration": calibration_report(player_pool) if len(player_pool) else {},
         "top_features": importances,
     }
 

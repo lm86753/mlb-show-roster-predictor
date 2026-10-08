@@ -92,7 +92,54 @@ def test_market_metrics_respect_ovr_cap():
     mm = player_market_metrics(np.array([84, 99]), probs)
     assert mm.loc[0, "upgrade_probability"] == pytest.approx(1.0)
     assert mm.loc[0, "expected_qs_change"] == pytest.approx(3750 - 1500)
-    assert mm.loc[0, "tier_up_probability"] == pytest.approx(1.0)  # 84 -> 86 crosses into Gold
+    assert mm.loc[0, "tier_up_probability"] == pytest.approx(1.0)  # 84 -> 86 crosses into Diamond
+    assert mm.loc[0, "diamond_probability"] == pytest.approx(1.0)
     # A 99 can't go up: mass folds back onto "no change".
     assert mm.loc[1, "upgrade_probability"] == pytest.approx(0.0)
     assert mm.loc[1, "p_no_change"] == pytest.approx(1.0)
+
+
+def test_player_resolver_prefers_role_and_team(monkeypatch):
+    from src.ingest import cards
+
+    monkeypatch.setattr(cards, "_team_org_names", lambda: {133: "Athletics", 119: "Dodgers", 145: "White Sox"})
+    dodgers_muncy = {"id": 1, "fullName": "Max Muncy", "primaryPosition": {"abbreviation": "3B"}, "currentTeam": {"id": 119}, "active": True, "mlbDebutDate": "2015-04-25"}
+    as_muncy = {"id": 2, "fullName": "Max Muncy", "primaryPosition": {"abbreviation": "3B"}, "currentTeam": {"id": 133}, "active": True, "mlbDebutDate": "2025-03-27"}
+    romo = {"id": 3, "fullName": "Drew Romo", "primaryPosition": {"abbreviation": "C"}, "currentTeam": {"id": 145}, "active": True}
+    rom = {"id": 4, "fullName": "Drew Rom", "primaryPosition": {"abbreviation": "P"}, "currentTeam": {"id": 133}, "active": True}
+
+    def best(people, name, team, pos):
+        return max(people, key=lambda p: cards.score_candidate(p, name, team, pos))["id"]
+
+    assert best([dodgers_muncy, as_muncy], "Max Muncy", "Athletics", "3B") == 2
+    assert best([dodgers_muncy, as_muncy], "Max Muncy", "Dodgers", "3B") == 1
+    assert best([romo, rom], "Drew Rom", "Athletics", "RP") == 4
+    # A pitcher card must never accept a position player.
+    assert cards.score_candidate(romo, "Drew Rom", "Athletics", "RP") < 3.0
+    assert cards._norm_name("Luis García Jr.") == "luisgarcia"
+
+
+def test_silver_to_gold_uses_real_tier_floors():
+    from src.models.train import OVR_MOVES, player_market_metrics
+
+    probs = np.zeros((2, len(OVR_MOVES)))
+    probs[0, OVR_MOVES.index(1)] = 0.6   # 79 -> 80 is Silver -> Gold
+    probs[0, OVR_MOVES.index(0)] = 0.4
+    probs[1, OVR_MOVES.index(4)] = 1.0   # 75 -> 79 stays Silver
+    mm = player_market_metrics(np.array([79, 75]), probs)
+    assert mm.loc[0, "gold_probability"] == pytest.approx(0.6)
+    assert mm.loc[0, "tier_up_probability"] == pytest.approx(0.6)
+    assert mm.loc[1, "gold_probability"] == pytest.approx(0.0)
+    assert mm.loc[1, "tier_up_probability"] == pytest.approx(0.0)
+    assert sum(mm.loc[0, "move_probs"]) == pytest.approx(1.0)
+
+
+def test_reliability_table_buckets():
+    import pandas as pd
+    from src.models.train import reliability_table
+
+    probs = pd.Series([0.02, 0.03, 0.9, 0.95])
+    happened = pd.Series([0.0, 0.0, 1.0, 0.0])
+    rows = reliability_table(probs, happened)
+    assert [r["n"] for r in rows] == [2, 2]
+    assert rows[0]["actual"] == 0.0 and rows[1]["actual"] == 0.5
