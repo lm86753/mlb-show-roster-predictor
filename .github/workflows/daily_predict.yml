@@ -19,14 +19,27 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Backfill roster updates (incremental)
-        run: python scripts/backfill_updates.py --years 26
+      # The SQLite DB, raw SDS updates and MLB API caches aren't in git, so
+      # carry them between runs. A cold cache rebuilds everything (~15 min).
+      - name: Restore data cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/predictor.db
+            data/raw
+            data/cache
+          key: predictor-data-${{ github.run_id }}
+          restore-keys: predictor-data-
 
-      - name: Train models if missing
-        run: |
-          if [ ! -f data/models/layer1_attributes.joblib ]; then
-            python scripts/train.py --skip-stats
-          fi
+      - name: Update data, retrain if a new attribute update landed, score cards
+        run: python scripts/daily_predict.py
 
-      - name: Run daily predictions (T-7, T-3, T-1)
-        run: python scripts/daily_predict.py --horizons 7 3 1
+      - name: Export static predictions
+        run: python scripts/export_static_predictions.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: predictions
+          path: |
+            data/static_predictions.json
+            data/models/backtest_summary.json

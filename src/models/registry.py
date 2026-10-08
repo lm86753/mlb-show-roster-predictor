@@ -287,6 +287,11 @@ _ALIASES: dict[str, str] = {
     "reac_r": "fielding_ability",
     "steal": "speed", "bnt": "bunting_ability",
     "drg_bnt": "drag_bunting_ability", "pop": "blocking",
+    # MLB 26 roster-update labels (upper-case, space separated)
+    "h/9 r": "h_per_9_r", "k/9 r": "k_per_9_r", "k/9 l": "k_per_9_l",
+    "reac f": "fielding_ability", "reac b": "fielding_ability",
+    "reac r": "fielding_ability", "reac l": "fielding_ability",
+    "stl": "speed", "drg bnt": "drag_bunting_ability",
 }
 
 
@@ -302,8 +307,8 @@ def normalize_attr_name(name: str, game_year: int | None = None) -> str:
     if result != name:
         return result
 
-    if name in _ALIASES:
-        return _ALIASES[name]
+    if name.lower() in _ALIASES:
+        return _ALIASES[name.lower()]
 
     for label, canon in _CANONICAL.items():
         if name.lower() == canon.lower():

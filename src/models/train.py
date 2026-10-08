@@ -1,463 +1,634 @@
 """
-Three-signal ensemble training pipeline.
+Attribute-update model: training + walk-forward backtest.
 
-Architecture:
-  Signal 1: Multi-window gap projection (formula-based, "today" weighted blend)
-  Signal 2: Gradient boosted delta regression (LightGBM)
-  Signal 3: Historical analog matching (nearest-neighbor from feature space)
+Per stat group (hitting / pitching) we fit three signals for each attribute's
+delta at the next monthly attribute update:
 
-  Ensemble: Learned weighted blend of all 3 signals
-  Confidence: Bucketed error percentiles from walk-forward validation
+  S1  gap      — per-attribute linear response to the gap between the card's
+                 rating and the rating its stats "deserve" (a Ridge projector)
+  S2  gbm      — LightGBM regressor on ratings, stat windows and history
+  S3  analog   — k-nearest historical (card, attribute) situations
+
+plus a 3-class LightGBM classifier for P(up) / P(down).
+
+Everything downstream of the base models is learned from *out-of-fold*
+predictions produced walk-forward (train on updates < k, predict update k):
+the stacking weights, the prediction intervals, and the map from attribute
+deltas to an OVR delta with its error distribution. The backtest for update
+k only ever uses parameters fitted on updates < k, so the reported metrics
+are what you'd actually have seen live.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import Ridge
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.model_selection import TimeSeriesSplit
+from scipy.stats import spearmanr
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+from src.config import CORE_ATTRS, MODELS_DIR, PROCESSED_DIR, STAT_CUTOFF_DAYS, quicksell_value
+from src.features.dataset import feature_columns
+from src.features.windows import HIT_RATES, PIT_RATES
 
 try:
-    from lightgbm import LGBMRegressor
-except ImportError:
-    LGBMRegressor = None
-
-from src.config import HITTER_ATTRS, MODELS_DIR, PITCHER_ATTRS, PROCESSED_DIR
-from src.db import ModelMetrics, init_db
-from src.features.engineering import REGRESSION_FEATURES, ANALOG_FEATURES
-from src.formulas.ratings import refit_and_save, project_attribute, LEAGUE_AVG
-from src.models.registry import normalize_attr_name, stat_group
+    from lightgbm import LGBMClassifier, LGBMRegressor
+except ImportError:  # pragma: no cover
+    LGBMClassifier = LGBMRegressor = None
 
 logger = logging.getLogger(__name__)
 
+MODEL_PATH = MODELS_DIR / "update_model.joblib"
+SUMMARY_PATH = MODELS_DIR / "backtest_summary.json"
+SIGNALS = ["s_gap", "s_gbm", "s_analog"]
+INTERVAL_Q = (0.1, 0.9)  # 80% prediction interval
+OVR_MOVES = list(range(-4, 5))  # integer OVR moves; tails clipped to ±4
+# Live Series rarity floors: Bronze 65, Silver 75, Gold 80, Diamond 85.
+TIER_FLOORS = np.array([65, 75, 80, 85])
+SILVER_FLOOR, GOLD_FLOOR, DIAMOND_FLOOR = 75, 80, 85
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Component 1: Per-attribute calibration (kept from old system)
-# ═══════════════════════════════════════════════════════════════════════════
 
-def compute_calibration(
-    df: pd.DataFrame,
-    min_samples: int = 10,
-) -> dict:
-    cal: dict = {}
-    changes = df[df["delta"] != 0].copy()
-    changes["abs_delta"] = changes["delta"].abs()
-    changes["abs_gap"] = changes["gap"].abs()
-    changes["ratio"] = np.where(
-        changes["abs_gap"] > 0.5,
-        (changes["abs_delta"] / changes["abs_gap"]).clip(0, 2),
-        np.nan,
+def _projector_cols(group: str) -> list[str]:
+    rates = HIT_RATES if group == "hitting" else PIT_RATES
+    n = "pa" if group == "hitting" else "bf"
+    return [f"{w}_{r}" for w in ("stab", "prev", "ytd", "30d") for r in rates] + [f"ytd_{n}", f"prev_{n}"]
+
+
+def _analog_cols(group: str) -> list[str]:
+    rates = HIT_RATES if group == "hitting" else PIT_RATES
+    return (
+        ["gap", "rating_before", "rating_minus_ovr", "last_delta", "prev_major_delta"]
+        + [f"stab_{r}" for r in rates] + [f"30d_{r}" for r in rates]
     )
 
-    for year, year_group in changes.groupby("game_year"):
-        year = int(year)
-        cal[year] = {}
-        for attr, group in year_group.groupby("attribute_name"):
-            attr = normalize_attr_name(attr)
-            if attr in cal[year]:
-                continue
-            if len(group) < min_samples:
-                continue
-            ratios = group["ratio"].dropna()
-            abs_gaps = group["abs_gap"].dropna()
-            abs_deltas = group["abs_delta"].dropna()
-            if ratios.empty or abs_gaps.empty:
-                continue
-            cal[year][attr] = {
-                "thresh": float(np.percentile(abs_gaps, 30)),
-                "scale": float(np.median(ratios)),
-                "max": float(np.percentile(abs_deltas, 95)),
-            }
-        group_pool: dict[str, list[dict]] = {}
-        for attr, group in year_group.groupby("attribute_name"):
-            attr_norm = normalize_attr_name(attr)
-            if attr_norm in cal[year]:
-                continue
-            sg = stat_group(attr_norm)
-            if sg not in group_pool:
-                group_pool[sg] = []
-            ratios = group["ratio"].dropna()
-            abs_gaps = group["abs_gap"].dropna()
-            abs_deltas = group["abs_delta"].dropna()
-            if not ratios.empty:
-                group_pool[sg].append({
-                    "ratio_med": float(np.median(ratios)),
-                    "max_delta": float(np.percentile(abs_deltas, 95)),
-                    "thresh": float(np.percentile(abs_gaps, 30)),
-                })
-        for sg, entries in group_pool.items():
-            if not entries:
-                continue
-            merged = {
-                "thresh": float(np.median([e["thresh"] for e in entries])),
-                "scale": float(np.median([e["ratio_med"] for e in entries])),
-                "max": float(np.median([e["max_delta"] for e in entries])),
-            }
-            for attr in HITTER_ATTRS + PITCHER_ATTRS:
-                if stat_group(attr) == sg and attr not in cal[year]:
-                    cal[year][attr] = dict(merged)
+
+def _model_cols(group: str) -> list[str]:
+    return feature_columns(group) + ["proj", "gap"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Base models for one group
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class GroupModel:
+    group: str
+    projectors: dict = field(default_factory=dict)
+    gap_slopes: dict = field(default_factory=dict)
+    analogs: dict = field(default_factory=dict)
+    gbm: object = None
+    clf: object = None
+
+    def fit(self, df: pd.DataFrame) -> "GroupModel":
+        df = df.copy()
+        y_after = df["rating_before"] + df["delta"]
+        pcols = _projector_cols(self.group)
+        for attr, sub in df.groupby("attr"):
+            proj = make_pipeline(SimpleImputer(strategy="median", keep_empty_features=True), StandardScaler(), Ridge(alpha=3.0))
+            proj.fit(sub[pcols], y_after.loc[sub.index])
+            self.projectors[attr] = proj
+        self._add_projection(df)
+
+        for attr, sub in df.groupby("attr"):
+            lr = LinearRegression().fit(sub[["gap"]].fillna(0), sub["delta"])
+            self.gap_slopes[attr] = (float(lr.coef_[0]), float(lr.intercept_))
+            knn = make_pipeline(
+                SimpleImputer(strategy="median", keep_empty_features=True), StandardScaler(),
+                KNeighborsRegressor(n_neighbors=min(60, len(sub)), weights="distance"),
+            )
+            knn.fit(sub[_analog_cols(self.group)], sub["delta"])
+            self.analogs[attr] = knn
+
+        X = df[_model_cols(self.group)]
+        common = dict(
+            n_estimators=500, learning_rate=0.03, num_leaves=31, min_child_samples=40,
+            subsample=0.8, subsample_freq=1, colsample_bytree=0.8, reg_lambda=1.0, verbose=-1,
+        )
+        self.gbm = LGBMRegressor(**common).fit(X, df["delta"], categorical_feature=["attr_code"])
+        direction = np.sign(df["delta"]).astype(int) + 1  # 0=down 1=flat 2=up
+        self.clf = LGBMClassifier(objective="multiclass", **common).fit(X, direction, categorical_feature=["attr_code"])
+        return self
+
+    def _add_projection(self, df: pd.DataFrame) -> None:
+        pcols = _projector_cols(self.group)
+        proj = pd.Series(np.nan, index=df.index)
+        for attr, sub in df.groupby("attr"):
+            if attr in self.projectors:
+                proj.loc[sub.index] = self.projectors[attr].predict(sub[pcols])
+        df["proj"] = proj
+        df["gap"] = proj - df["rating_before"]
+
+    def predict(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        self._add_projection(df)
+        out = pd.DataFrame(index=df.index)
+        out["proj"], out["gap"] = df["proj"], df["gap"]
+        out["s_gap"] = 0.0
+        out["s_analog"] = 0.0
+        for attr, sub in df.groupby("attr"):
+            slope, icpt = self.gap_slopes.get(attr, (0.0, 0.0))
+            out.loc[sub.index, "s_gap"] = sub["gap"].fillna(0) * slope + icpt
+            if attr in self.analogs:
+                out.loc[sub.index, "s_analog"] = self.analogs[attr].predict(sub[_analog_cols(self.group)])
+        X = df[_model_cols(self.group)]
+        out["s_gbm"] = self.gbm.predict(X)
+        proba = self.clf.predict_proba(X)
+        classes = list(self.clf.classes_)
+        out["p_down"] = proba[:, classes.index(0)] if 0 in classes else 0.0
+        out["p_up"] = proba[:, classes.index(2)] if 2 in classes else 0.0
+        return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Calibration layer (learned from out-of-fold predictions)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Calibration:
+    """Stacking weights, intervals and OVR mapping for one group."""
+    weights: dict = field(default_factory=lambda: {"s_gap": 0.0, "s_gbm": 1.0, "s_analog": 0.0, "intercept": 0.0})
+    intervals: list = field(default_factory=list)   # [{"max_abs": x, "lo": q10, "hi": q90}]
+    ovr_coef: dict = field(default_factory=dict)    # attr → weight of its delta in OVR
+    ovr_intercept: float = 0.0
+    ovr_clf: object = None                          # P(OVR move = k | mu, ovr)
+    n_oof: int = 0
+
+    def ensemble(self, sig: pd.DataFrame) -> pd.Series:
+        w = self.weights
+        return w["intercept"] + sum(sig[s] * w[s] for s in SIGNALS)
+
+    def interval(self, pred: pd.Series) -> tuple[pd.Series, pd.Series]:
+        if not self.intervals:
+            return pred - 4.0, pred + 4.0
+        lo, hi = pd.Series(np.nan, index=pred.index), pd.Series(np.nan, index=pred.index)
+        a = pred.abs()
+        prev = -1.0
+        for b in self.intervals:
+            m = (a > prev) & (a <= b["max_abs"])
+            lo[m], hi[m] = pred[m] + b["lo"], pred[m] + b["hi"]
+            prev = b["max_abs"]
+        return lo.fillna(pred - 4.0), hi.fillna(pred + 4.0)
+
+    def ovr_move_probs(self, mu: np.ndarray, ovr: np.ndarray) -> np.ndarray:
+        """(n, len(OVR_MOVES)) probabilities of each integer OVR move."""
+        if self.ovr_clf is None:
+            return _normal_move_probs(mu, sd=1.0)
+        raw = self.ovr_clf.predict_proba(_ovr_features(mu, ovr))
+        probs = np.zeros((len(mu), len(OVR_MOVES)))
+        for j, k in enumerate(self.ovr_clf.classes_):
+            probs[:, OVR_MOVES.index(int(k))] = raw[:, j]
+        return probs
+
+    def ovr_mean(self, pivot: pd.DataFrame) -> pd.Series:
+        mu = pd.Series(self.ovr_intercept, index=pivot.index)
+        for attr, c in self.ovr_coef.items():
+            if attr in pivot:
+                mu += pivot[attr].fillna(0) * c
+        return mu
+
+
+def fit_calibration(oof: pd.DataFrame, group: str) -> Calibration:
+    cal = Calibration(n_oof=len(oof))
+    if len(oof) < 500:
+        return cal
+
+    stack = LinearRegression(positive=True).fit(oof[SIGNALS], oof["delta"])
+    cal.weights = {s: float(c) for s, c in zip(SIGNALS, stack.coef_)} | {"intercept": float(stack.intercept_)}
+    ens = cal.ensemble(oof)
+    resid = oof["delta"] - ens
+
+    edges = [0.25, 0.75, 1.5, 3.0, 99.0]
+    prev = -1.0
+    for e in edges:
+        r = resid[(ens.abs() > prev) & (ens.abs() <= e)]
+        if len(r) >= 50:
+            cal.intervals.append({"max_abs": e, "lo": float(r.quantile(INTERVAL_Q[0])), "hi": float(r.quantile(INTERVAL_Q[1])), "n": int(len(r))})
+        prev = e
+
+    pivot, players = player_frame(pd.concat([oof, ens.rename("ens")], axis=1), group)
+    if len(players) >= 100:
+        attrs = [a for a in CORE_ATTRS[group] if a in pivot]
+        ridge = Ridge(alpha=1.0, positive=True).fit(pivot[attrs].fillna(0), players["ovr_delta"])
+        cal.ovr_coef = {a: float(c) for a, c in zip(attrs, ridge.coef_)}
+        cal.ovr_intercept = float(ridge.intercept_)
+        mu = cal.ovr_mean(pivot).to_numpy()
+        moves = players["ovr_delta"].clip(OVR_MOVES[0], OVR_MOVES[-1]).astype(int)
+        cal.ovr_clf = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000)).fit(
+            _ovr_features(mu, players["ovr_before"].to_numpy()), moves
+        )
     return cal
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Component 2: Direct delta regression (Signal 2)
-# ═══════════════════════════════════════════════════════════════════════════
+def _ovr_features(mu: np.ndarray, ovr: np.ndarray) -> np.ndarray:
+    mu = np.asarray(mu, dtype=float)
+    ovr = np.asarray(ovr, dtype=float)
+    return np.column_stack([mu, np.abs(mu), np.clip(mu, 0, None), ovr, ovr >= 99])
 
-def train_delta_regression(df: pd.DataFrame) -> dict:
-    """Train LightGBM regressor to directly predict delta.
 
-    Returns dict with 'hitter' and 'pitcher' models (or dict with dummy
-    if insufficient data).
+def player_frame(rows: pd.DataFrame, group: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Pivot attribute predictions to one row per (card, as_of) for OVR.
+
+    A card's OVR is driven by its display group: pitchers by pitching attrs,
+    everyone else by hitting attrs.
     """
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    df = df.copy()
-    df["is_hitter_flag"] = df["is_hitter"].astype(int)
-
-    models = {}
-    for label, is_hitter in [("hitter", 1), ("pitcher", 0)]:
-        sub = df[df["is_hitter_flag"] == is_hitter]
-        if len(sub) < 100:
-            logger.warning("Too few %s rows (%d); skipping regression.", label, len(sub))
-            models[label] = {"dummy": True}
-            continue
-
-        X = sub[REGRESSION_FEATURES].fillna(0).values
-        y = sub["delta"].fillna(0).values
-
-        if LGBMRegressor is None:
-            logger.warning("lightgbm not available; using Ridge fallback for %s.", label)
-            from sklearn.linear_model import Ridge
-            model = Ridge(alpha=10.0)
-            model.fit(X, y)
-            models[label] = model
-            continue
-
-        model = LGBMRegressor(
-            n_estimators=300,
-            max_depth=5,
-            learning_rate=0.03,
-            num_leaves=31,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_samples=20,
-            reg_alpha=1.0,
-            reg_lambda=1.0,
-            verbose=-1,
-        )
-        model.fit(X, y)
-
-        # Feature importance
-        paired = sorted(zip(REGRESSION_FEATURES, model.feature_importances_), key=lambda x: -x[1])
-        logger.info("── Delta regression (%s) top-10 features ──", label)
-        for fname, imp in paired[:10]:
-            logger.info("  %-40s %6d", fname, imp)
-
-        models[label] = model
-
-    path = MODELS_DIR / "delta_regression.joblib"
-    joblib.dump(models, path)
-    logger.info("Delta regression models saved to %s", path)
-    return models
+    is_pitch = 1 if group == "pitching" else 0
+    sub = rows[rows["is_pitcher_card"] == is_pitch]
+    key = ["card_uuid", "as_of"]
+    pivot = sub.pivot_table(index=key, columns="attr", values="ens", aggfunc="first")
+    meta_cols = [c for c in ("ovr_before", "ovr_after") if c in sub]
+    players = sub.groupby(key)[meta_cols].first()
+    if "ovr_after" in players:
+        players["ovr_delta"] = players["ovr_after"] - players["ovr_before"]
+    return pivot, players.loc[pivot.index]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Component 3: Historical analog index (Signal 3)
+#  Player-level distribution helpers (shared with predict.py)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def build_analog_index(df: pd.DataFrame) -> dict:
-    """Build an index of historical player stat profiles → actual outcomes.
+def _normal_move_probs(mu: np.ndarray, sd: float) -> np.ndarray:
+    """Fallback before any out-of-fold data exists: discretized normal."""
+    from scipy.stats import norm
 
-    For each row in the training data, stores the analog feature vector
-    and the actual delta that occurred. During prediction, we find the
-    k nearest neighbors and aggregate their outcomes.
+    moves = np.array(OVR_MOVES)
+    upper = norm.cdf((moves[None, :] + 0.5 - mu[:, None]) / sd)
+    lower = norm.cdf((moves[None, :] - 0.5 - mu[:, None]) / sd)
+    probs = upper - lower
+    return probs / probs.sum(axis=1, keepdims=True)
 
-    Returns dict with:
-      - feature_mean / feature_std: normalization params
-      - vectors: normalized analog feature matrix (n_samples x n_features)
-      - outcomes: array of actual deltas corresponding to each vector
-      - feature_names: list of feature column names used
-    """
-    analog_df = df[ANALOG_FEATURES + ["delta"]].dropna(subset=ANALOG_FEATURES).copy()
-    if analog_df.empty:
-        logger.warning("No analog data available.")
-        return {}
 
-    X = analog_df[ANALOG_FEATURES].values.astype(np.float64)
-    y = analog_df["delta"].values.astype(np.float64)
+def _cap_at_99(ovr: np.ndarray, probs: np.ndarray) -> np.ndarray:
+    """OVR can't exceed 99: fold impossible upward mass back onto the cap."""
+    moves = np.array(OVR_MOVES)
+    over = (ovr[:, None] + moves[None, :]) > 99
+    if not over.any():
+        return probs
+    capped = (probs * over).sum(axis=1)
+    probs = np.where(over, 0.0, probs)
+    at_cap = (99 - ovr).clip(moves[0], moves[-1]) - moves[0]
+    probs[np.arange(len(ovr)), at_cap.astype(int)] += capped
+    return probs
 
-    mean = np.nanmean(X, axis=0)
-    std = np.nanstd(X, axis=0)
-    std[std < 1e-12] = 1.0
-    X_norm = (X - mean) / std
 
-    index = {
-        "feature_mean": mean.tolist(),
-        "feature_std": std.tolist(),
-        "vectors": X_norm,
-        "outcomes": y.tolist(),
-        "feature_names": list(ANALOG_FEATURES),
+def player_market_metrics(ovr: np.ndarray, probs: np.ndarray) -> pd.DataFrame:
+    probs = _cap_at_99(ovr, probs)
+    moves = np.array(OVR_MOVES)
+    expected = (probs * moves).sum(axis=1)
+    new_ovr = (ovr[:, None] + moves[None, :]).clip(40, 99)
+    qs_now = np.array([quicksell_value(int(o)) for o in ovr])
+    qs_new = np.vectorize(quicksell_value)(new_ovr)
+    tier_now = np.searchsorted(TIER_FLOORS, ovr, side="right")
+    tier_new = np.searchsorted(TIER_FLOORS, new_ovr, side="right")
+    return pd.DataFrame({
+        "upgrade_probability": (probs * (moves > 0)).sum(axis=1),
+        "downgrade_probability": (probs * (moves < 0)).sum(axis=1),
+        "tier_up_probability": (probs * (tier_new > tier_now[:, None])).sum(axis=1),
+        "tier_down_probability": (probs * (tier_new < tier_now[:, None])).sum(axis=1),
+        "expected_qs_change": (probs * (qs_new - qs_now[:, None])).sum(axis=1),
+        "qs_upside": (probs * np.maximum(qs_new - qs_now[:, None], 0)).sum(axis=1),
+        "current_qs": qs_now,
+        "expected_move": expected,
+        "sd": np.sqrt((probs * (moves[None, :] - expected[:, None]) ** 2).sum(axis=1)),
+        "p_no_change": probs[:, OVR_MOVES.index(0)],
+        # Chance the card is Gold / Diamond after the update (the Silver -> Gold estimate).
+        "gold_probability": (probs * (new_ovr >= GOLD_FLOOR)).sum(axis=1),
+        "diamond_probability": (probs * (new_ovr >= DIAMOND_FLOOR)).sum(axis=1),
+        "move_probs": list(np.round(probs, 4)),
+    })
+
+
+def _move_quantile(probs: np.ndarray, q: float) -> np.ndarray:
+    """Integer OVR move at the q-th quantile of each row's distribution."""
+    cdf = np.cumsum(probs, axis=1)
+    return np.array(OVR_MOVES)[(cdf < q - 1e-9).sum(axis=1).clip(0, len(OVR_MOVES) - 1)]
+
+
+def _is_silver(ovr: pd.Series) -> pd.Series:
+    return (ovr >= SILVER_FLOOR) & (ovr < GOLD_FLOOR)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Walk-forward backtest
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _attr_metrics(df: pd.DataFrame) -> dict:
+    y, p = df["delta"], df["ens"]
+    moved = (y != 0) & (p.abs() >= 0.5)
+    sse, sse0 = ((y - p) ** 2).sum(), (y ** 2).sum()
+    rho = spearmanr(y, p).correlation if p.std() > 0 else 0.0
+    out = {
+        "attr_mae": float((y - p).abs().mean()),
+        "attr_mae_baseline": float(y.abs().mean()),
+        "attr_skill": float(1 - sse / sse0) if sse0 else 0.0,
+        "attr_spearman": float(rho),
+        "attr_direction_acc": float((np.sign(y[moved]) == np.sign(p[moved])).mean()) if moved.any() else None,
+        "interval_coverage": float(((y >= df["lo"]) & (y <= df["hi"])).mean()),
+    }
+    for s in SIGNALS:
+        out[f"{s}_mae"] = float((y - df[s]).abs().mean())
+    return out
+
+
+def _player_metrics(players: pd.DataFrame) -> dict:
+    y, mu = players["ovr_delta"], players["mu"]
+    up = (y > 0).astype(float)
+    brier = float(((players["upgrade_probability"] - up) ** 2).mean())
+    brier0 = float(((up.mean() - up) ** 2).mean())
+    top_up = players.nlargest(25, "mu")
+    top_dn = players.nsmallest(25, "mu")
+    top_ev = players.nlargest(25, "expected_qs_change")
+    realized_qs = players["ovr_after"].map(quicksell_value) - players["ovr_before"].map(quicksell_value)
+    down = (y < 0).astype(float)
+    tier_up = _tier_up(players)
+    probs = np.vstack(players["move_probs"].to_numpy())
+    lo, hi = _move_quantile(probs, INTERVAL_Q[0]), _move_quantile(probs, INTERVAL_Q[1])
+    ev = players["expected_qs_change"]
+    out = {
+        "ovr_mae": float((y - mu).abs().mean()),
+        "ovr_mae_baseline": float(y.abs().mean()),
+        "ovr_spearman": float(spearmanr(y, mu).correlation),
+        "upgrade_brier": brier,
+        "upgrade_brier_baseline": brier0,
+        "upgrade_prob_mean": float(players["upgrade_probability"].mean()),
+        "downgrade_prob_mean": float(players["downgrade_probability"].mean()),
+        "top25_up_hit_rate": float((top_up["ovr_delta"] > 0).mean()),
+        "top25_up_avg_ovr_delta": float(top_up["ovr_delta"].mean()),
+        "top25_down_hit_rate": float((top_dn["ovr_delta"] < 0).mean()),
+        "top25_ev_avg_qs_gain": float(realized_qs.loc[top_ev.index].mean()),
+        "all_avg_qs_gain": float(realized_qs.mean()),
+        "base_rate_up": float((y > 0).mean()),
+        "base_rate_down": float((y < 0).mean()),
+        "n_players": int(len(players)),
+        "downgrade_brier": float(((players["downgrade_probability"] - down) ** 2).mean()),
+        "downgrade_brier_baseline": float(((down.mean() - down) ** 2).mean()),
+        "tier_up_brier": float(((players["tier_up_probability"] - tier_up) ** 2).mean()),
+        "tier_up_brier_baseline": float(((tier_up.mean() - tier_up) ** 2).mean()),
+        "tier_up_prob_mean": float(players["tier_up_probability"].mean()),
+        "base_rate_tier_up": float(tier_up.mean()),
+        "ovr_interval_coverage": float(((y >= lo) & (y <= hi)).mean()),
+        "qs_ev_mae": float((ev - realized_qs).abs().mean()),
+        "qs_ev_mae_baseline": float(realized_qs.abs().mean()),
+        "qs_ev_spearman": float(spearmanr(ev, realized_qs).correlation) if ev.std() > 0 else None,
+    }
+    out.update(_silver_to_gold_metrics(players, realized_qs))
+    return out
+
+
+def _tier_up(players: pd.DataFrame) -> pd.Series:
+    after = np.searchsorted(TIER_FLOORS, players["ovr_after"], side="right")
+    before = np.searchsorted(TIER_FLOORS, players["ovr_before"], side="right")
+    return pd.Series((after > before).astype(float), index=players.index)
+
+
+S2G_TOP_N = 10
+
+
+def _silver_to_gold_metrics(players: pd.DataFrame, realized_qs: pd.Series) -> dict:
+    """How well P(a Silver card is Gold after the update) held up."""
+    silver = players[_is_silver(players["ovr_before"])]
+    if silver.empty:
+        return {"s2g_n": 0}
+    hit = (silver["ovr_after"] >= GOLD_FLOOR).astype(float)
+    top = silver.nlargest(S2G_TOP_N, "gold_probability")
+    return {
+        "s2g_n": int(len(silver)),
+        "s2g_base_rate": float(hit.mean()),
+        "s2g_prob_mean": float(silver["gold_probability"].mean()),
+        "s2g_brier": float(((silver["gold_probability"] - hit) ** 2).mean()),
+        "s2g_brier_baseline": float(((hit.mean() - hit) ** 2).mean()),
+        "s2g_top_hit_rate": float(hit.loc[top.index].mean()),
+        # Bought at the quicksell floor before the update, quicksold after it.
+        "s2g_top_avg_qs_gain": float(realized_qs.loc[top.index].mean()),
     }
 
-    path = MODELS_DIR / "analog_index.joblib"
-    joblib.dump(index, path)
-    logger.info("Analog index built with %d samples, %d features", len(y), len(ANALOG_FEATURES))
-    return index
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Component 4: Ensemble blend weights
-# ═══════════════════════════════════════════════════════════════════════════
-
-def train_ensemble_weights(
-    df: pd.DataFrame,
-    signal1_preds: np.ndarray | None = None,
-) -> dict:
-    """Return fixed ensemble blend weights.
-
-    The 3-signal ensemble uses fixed weights based on observed performance:
-      Signal 1 (gap projection): primary signal, most reliable → 50%
-      Signal 2 (delta regression): complementary, noisy → 30%
-      Signal 3 (analog matching): contextual, sparse → 20%
-
-    Learned weights from Ridge are unreliable because:
-      - Signal 2 overfits when trained/predicted on same fold
-      - Data noise makes Ridge weights unstable across folds
-    """
-    group_weights = {
-        "hitter": {"w_signal1": 0.50, "w_signal2": 0.30, "w_signal3": 0.20},
-        "pitcher": {"w_signal1": 0.50, "w_signal2": 0.30, "w_signal3": 0.20},
-    }
-    path = MODELS_DIR / "ensemble_weights.json"
-    path.write_text(json.dumps(group_weights, indent=2), encoding="utf-8")
-    logger.info("Ensemble weights: s1=0.50 s2=0.30 s3=0.20 (fixed)")
-    return group_weights
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Component 5: Confidence interval calibration
-# ═══════════════════════════════════════════════════════════════════════════
-
-def calibrate_confidence_intervals(df: pd.DataFrame) -> dict:
-    """Compute error percentiles bucketed by absolute gap_today.
-
-    Returns a list of buckets: [{"max_gap": 2.0, "p10": ..., "p90": ...}, ...]
-    """
-    df = df.copy()
-    df["abs_gap"] = df["gap_today"].abs()
-    # Predicted delta ≈ gap * 0.15, so error = |predicted - actual|
-    predicted = np.clip(df["gap_today"].fillna(0), -20, 20) * 0.15
-    df["error"] = (predicted - df["delta"].fillna(0)).abs()
-
-    buckets = []
-    boundaries = [0, 1, 2, 3, 4, 6, 8, 12, 99]
-    for i in range(len(boundaries) - 1):
-        lo, hi = boundaries[i], boundaries[i + 1]
-        subset = df[(df["abs_gap"] >= lo) & (df["abs_gap"] < hi)]
-        if len(subset) < 5:
-            continue
-        errors = subset["error"].values
-        buckets.append({
-            "min_gap": lo,
-            "max_gap": hi,
-            "p10": float(np.percentile(errors, 10)),
-            "p25": float(np.percentile(errors, 25)),
-            "p50": float(np.percentile(errors, 50)),
-            "p75": float(np.percentile(errors, 75)),
-            "p90": float(np.percentile(errors, 90)),
-            "n": int(len(errors)),
-        })
-
-    path = MODELS_DIR / "confidence_buckets.json"
-    path.write_text(json.dumps(buckets, indent=2), encoding="utf-8")
-    logger.info("Confidence intervals calibrated across %d buckets", len(buckets))
-    return buckets
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Component 6: Per-position OVR weights (Ridge, kept from old system)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _fit_ovr_weights(df: pd.DataFrame) -> dict:
-    try:
-        from sklearn.linear_model import Ridge
-    except ImportError:
-        logger.warning("sklearn not available; skipping OVR weight fitting.")
-        return {}
-    weights = {}
-    for pos, group in df.groupby("position"):
-        if len(group) < 20 or not pos:
-            continue
-        pivot = group.pivot_table(
-            index=["game_year", "update_id", "card_uuid"],
-            columns="attribute_name",
-            values="delta",
-            aggfunc="sum",
-            fill_value=0,
-        )
-        if pivot.empty:
-            continue
-        ovr_deltas = group.groupby(["game_year", "update_id", "card_uuid"])["delta"].sum()
-        common = pivot.index.intersection(ovr_deltas.index)
-        if len(common) < 10:
-            continue
-        X = pivot.loc[common].values
-        y = ovr_deltas.loc[common].values
-        model = Ridge(alpha=10.0)
-        model.fit(X, y)
-        weights[pos] = {
-            "attributes": pivot.columns.tolist(),
-            "coef": model.coef_.tolist(),
-            "intercept": float(model.intercept_),
+def by_attribute_metrics(scored: pd.DataFrame) -> dict:
+    """Backtest accuracy for every predicted attribute, pooled over calibrated folds."""
+    out = {}
+    for (group, attr), sub in scored.groupby(["group", "attr"]):
+        out[attr] = _attr_metrics(sub) | {
+            "group": group,
+            "n": int(len(sub)),
+            "moved_rate": float((sub["delta"] != 0).mean()),
+            "bias": float((sub["ens"] - sub["delta"]).mean()),
         }
-    return weights
+    return out
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Market simulation calibration
-# ═══════════════════════════════════════════════════════════════════════════
-
-_QS_TIERS = [
-    (0, 25), (65, 100), (75, 300), (80, 600),
-    (85, 1000), (90, 5000), (92, 10000),
-    (94, 25000), (95, 50000), (97, 100000),
-]
+RELIABILITY_BINS = [0, 0.05, 0.15, 0.3, 0.5, 0.7, 0.85, 1.0001]
 
 
-def qs_value(ovr: int) -> int:
-    return max((v for k, v in _QS_TIERS if ovr >= k), default=0)
+def reliability_table(probs: pd.Series, happened: pd.Series) -> list[dict]:
+    """Forecast-probability buckets against how often the event actually happened."""
+    rows = []
+    for interval, idx in probs.groupby(pd.cut(probs, RELIABILITY_BINS, right=False), observed=True).groups.items():
+        if len(idx):
+            rows.append({
+                "lo": float(interval.left), "hi": float(min(interval.right, 1.0)),
+                "forecast": float(probs.loc[idx].mean()), "actual": float(happened.loc[idx].mean()),
+                "n": int(len(idx)),
+            })
+    return rows
 
 
-def calibrate_market_simulation(df: pd.DataFrame) -> dict:
-    """Calibrate market simulation from historical changes.
+def calibration_report(players: pd.DataFrame) -> dict:
+    y = players["ovr_after"] - players["ovr_before"]
+    silver = players[_is_silver(players["ovr_before"])]
+    return {
+        "upgrade": reliability_table(players["upgrade_probability"], (y > 0).astype(float)),
+        "downgrade": reliability_table(players["downgrade_probability"], (y < 0).astype(float)),
+        "tier_up": reliability_table(players["tier_up_probability"], _tier_up(players)),
+        "silver_to_gold": reliability_table(silver["gold_probability"], (silver["ovr_after"] >= GOLD_FLOOR).astype(float)),
+    }
 
-    Computes:
-      - avg_delta_per_attribute_group: how many OVR points change per update
-      - upgrade_prob_vs_gap: logistic mapping from gap_today → P(upgrade)
-      - downgrade_prob_vs_gap: logistic mapping from gap_today → P(downgrade)
-    """
-    cal: dict = {}
 
-    df = df.copy()
-    df["gap_today_abs"] = df["gap_today"].abs()
-    df["positive_delta"] = (df["delta"] > 0).astype(float)
-    df["negative_delta"] = (df["delta"] < 0).astype(float)
+def score_rows(rows: pd.DataFrame, sig: pd.DataFrame, cal: Calibration) -> pd.DataFrame:
+    out = rows.join(sig)
+    ens = cal.ensemble(out)
+    lo, hi = cal.interval(ens)
+    return pd.concat([out, pd.DataFrame({"ens": ens, "lo": lo, "hi": hi})], axis=1)
 
-    # Logistic calibration: bin by abs gap, compute observed probability
-    boundaries = [0, 0.5, 1.5, 2.5, 3.5, 5, 7, 10, 99]
-    prob_buckets = []
-    for i in range(len(boundaries) - 1):
-        lo, hi = boundaries[i], boundaries[i + 1]
-        subset = df[(df["gap_today_abs"] >= lo) & (df["gap_today_abs"] < hi)]
-        if len(subset) < 10:
+
+def score_players(scored: pd.DataFrame, cals: dict[str, Calibration]) -> pd.DataFrame:
+    frames = []
+    for group, cal in cals.items():
+        pivot, players = player_frame(scored, group)
+        if players.empty:
             continue
-        n_up = subset["positive_delta"].sum()
-        n_down = subset["negative_delta"].sum()
-        mid = (lo + hi) / 2
-        prob_buckets.append({
-            "gap_mid": mid,
-            "p_up": float(n_up / len(subset)),
-            "p_down": float(n_down / len(subset)),
-            "p_change": float((n_up + n_down) / len(subset)),
-            "n": int(len(subset)),
-        })
+        players = players.copy()
+        players["mu"] = cal.ovr_mean(pivot)
+        ovr = players["ovr_before"].to_numpy(int)
+        mm = player_market_metrics(ovr, cal.ovr_move_probs(players["mu"].to_numpy(), ovr))
+        mm.index = players.index
+        frames.append(players.join(mm))
+    return pd.concat(frames) if frames else pd.DataFrame()
 
-    cal["prob_buckets"] = prob_buckets
-    cal["qs_tiers"] = [{"min_ovr": k, "value": v} for k, v in _QS_TIERS]
 
-    path = MODELS_DIR / "market_calibration.json"
-    path.write_text(json.dumps(cal, indent=2), encoding="utf-8")
-    logger.info("Market simulation calibrated from %d total samples", len(df))
-    return cal
+def walk_forward(data: pd.DataFrame) -> tuple[pd.DataFrame, list[dict], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Returns (out-of-fold attribute rows, per-fold metrics, last fold's scored players,
+    and the scored attribute rows / players pooled over every calibrated fold)."""
+    dates = sorted(data["as_of"].unique())
+    oof_frames: list[pd.DataFrame] = []
+    folds = []
+    players = pd.DataFrame()
+    scored_pool: list[pd.DataFrame] = []
+    player_pool: list[pd.DataFrame] = []
+    for k in range(1, len(dates)):
+        train, test = data[data["as_of"] < dates[k]], data[data["as_of"] == dates[k]]
+        prior_oof = pd.concat(oof_frames) if oof_frames else pd.DataFrame()
+        fold_scored, fold_raw, cals = [], [], {}
+        for group in CORE_ATTRS:
+            tr, te = train[train["group"] == group], test[test["group"] == group]
+            sig = GroupModel(group).fit(tr).predict(te)
+            fold_raw.append(te.join(sig))
+            g_oof = prior_oof[prior_oof["group"] == group] if len(prior_oof) else prior_oof
+            cals[group] = fit_calibration(g_oof, group)
+            fold_scored.append(score_rows(te, sig, cals[group]))
+        scored = pd.concat(fold_scored)
+        players = score_players(scored, cals)
+        metrics = {"test_update": dates[k], "train_updates": k, **_attr_metrics(scored), **_player_metrics(players)}
+        folds.append(metrics)
+        logger.info(
+            "  fold %s: attr MAE %.3f (baseline %.3f) | OVR MAE %.3f (baseline %.3f) | top25 up hit %.0f%%",
+            dates[k], metrics["attr_mae"], metrics["attr_mae_baseline"],
+            metrics["ovr_mae"], metrics["ovr_mae_baseline"], 100 * metrics["top25_up_hit_rate"],
+        )
+        oof_frames.append(pd.concat(fold_raw))
+        if k > 1:  # the first fold has no earlier out-of-fold data to calibrate on
+            scored_pool.append(scored)
+            player_pool.append(players)
+
+    def pool(frames: list[pd.DataFrame]) -> pd.DataFrame:
+        return pd.concat(frames) if frames else pd.DataFrame()
+
+    return pd.concat(oof_frames), folds, players, pool(scored_pool), pool(player_pool)
+
+
+def last_update_review(players: pd.DataFrame, data: pd.DataFrame, n: int = 25) -> dict:
+    """The backtest's picks for the most recent update next to what actually happened."""
+    if players.empty:
+        return {}
+    p = players.reset_index()
+    names = data.groupby("card_uuid")["player_name"].first()
+    p["player_name"] = p["card_uuid"].map(names)
+    p["realized_qs"] = p["ovr_after"].map(quicksell_value) - p["ovr_before"].map(quicksell_value)
+
+    def rows(frame: pd.DataFrame) -> list[dict]:
+        return [
+            {
+                "card_uuid": r.card_uuid, "player_name": r.player_name,
+                "ovr_before": int(r.ovr_before), "ovr_after": int(r.ovr_after),
+                "predicted_delta": round(float(r.mu), 2),
+                "upgrade_probability": round(float(r.upgrade_probability), 3),
+                "downgrade_probability": round(float(r.downgrade_probability), 3),
+                "expected_qs_change": round(float(r.expected_qs_change), 1),
+                "gold_probability": round(float(r.gold_probability), 3),
+                "realized_qs_change": int(r.realized_qs),
+            }
+            for r in frame.itertuples()
+        ]
+
+    silver = p[_is_silver(p["ovr_before"])]
+    return {
+        "update": str(p["as_of"].iloc[0]),
+        "top_upgrades": rows(p.nlargest(n, "upgrade_probability")),
+        "top_downgrades": rows(p.nlargest(n, "downgrade_probability")),
+        "top_value": rows(p.nlargest(n, "expected_qs_change")),
+        "silver_to_gold": rows(silver.nlargest(n, "gold_probability")),
+    }
+
+
+def summarize(folds: list[dict]) -> dict:
+    """Mean over folds that had calibration fitted from earlier folds."""
+    calibrated = folds[1:] if len(folds) > 1 else folds
+    keys = [k for k in calibrated[0] if isinstance(calibrated[0][k], (int, float)) and k != "train_updates"]
+    summary = {}
+    for k in keys:
+        vals = [f[k] for f in calibrated if f.get(k) is not None]
+        summary[k] = float(np.mean(vals)) if vals else None
+    return summary
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Orchestrator
 # ═══════════════════════════════════════════════════════════════════════════
 
-def train_all(training_path: Path | None = None) -> dict:
-    path = training_path or PROCESSED_DIR / "training_examples.parquet"
-    if not path.exists():
-        from src.features.engineering import build_training_dataset
-        df = build_training_dataset()
-    else:
-        try:
-            df = pd.read_parquet(path)
-        except (ImportError, ModuleNotFoundError):
-            from src.features.engineering import build_training_dataset
-            df = build_training_dataset()
+def train_all(data: pd.DataFrame | None = None) -> dict:
+    if data is None:
+        path = PROCESSED_DIR / "training_examples.parquet"
+        if path.exists():
+            data = pd.read_parquet(path)
+        else:
+            from src.features.dataset import build_training_dataset
+            data = build_training_dataset()
+    if data.empty or data["as_of"].nunique() < 2:
+        raise ValueError("Need at least two major attribute updates to train. Run the backfill first.")
+    if LGBMRegressor is None:
+        raise ImportError("lightgbm is required for training")
 
-    if df.empty:
-        raise ValueError("No training data available. Run backfill first.")
+    logger.info("Walk-forward backtest over %d updates...", data["as_of"].nunique())
+    oof, folds, last_players, scored_pool, player_pool = walk_forward(data)
 
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info("Fitting final models on all %d rows...", len(data))
+    groups, cals = {}, {}
+    for group in CORE_ATTRS:
+        groups[group] = GroupModel(group).fit(data[data["group"] == group])
+        cals[group] = fit_calibration(oof[oof["group"] == group], group)
+        logger.info("  %s stacking weights: %s", group, {k: round(v, 3) for k, v in cals[group].weights.items()})
 
-    # 1. Refit formula coefficients (kept from old system)
-    coeffs = refit_and_save(df)
-
-    # 2. Per-attribute / per-year calibration
-    calibration = compute_calibration(df)
-    cal_path = MODELS_DIR / "calibration.json"
-    cal_path.write_text(json.dumps(calibration, indent=2, sort_keys=True), encoding="utf-8")
-    logger.info("Calibration computed for %d game years.", len(calibration))
-
-    # 3. Direct delta regression (Signal 2)
-    regression_models = train_delta_regression(df)
-
-    # 4. Historical analog index (Signal 3)
-    analog_index = build_analog_index(df)
-
-    # 5. Ensemble blend weights
-    ensemble_weights = train_ensemble_weights(df)
-
-    # 6. Confidence interval calibration
-    confidence_buckets = calibrate_confidence_intervals(df)
-
-    # 7. OVR weights per position
-    ovr_weights = _fit_ovr_weights(df)
-    joblib.dump(ovr_weights, MODELS_DIR / "ovr_weights.joblib")
-    logger.info("OVR weights fit for %d positions.", len(ovr_weights))
-
-    # 8. Market simulation calibration
-    market_cal = calibrate_market_simulation(df)
-
-    return {
-        "n_cal_years": len(calibration),
-        "regression_models": list(regression_models.keys()),
-        "analog_count": len(analog_index.get("outcomes", [])) if analog_index else 0,
-        "ensemble_weights": {k: v for k, v in ensemble_weights.items()},
-        "confidence_buckets": len(confidence_buckets),
-        "ovr_positions": len(ovr_weights),
-        "market_cal_samples": sum(b.get("n", 0) for b in market_cal.get("prob_buckets", [])),
+    importances = {
+        g: dict(sorted(
+            zip(_model_cols(g), (float(v) for v in m.gbm.booster_.feature_importance("gain"))),
+            key=lambda kv: -kv[1],
+        )[:15])
+        for g, m in groups.items()
+    }
+    summary = {
+        "trained_on": sorted(data["as_of"].unique().tolist()),
+        "n_rows": int(len(data)),
+        "folds": folds,
+        "summary": summarize(folds),
+        "stacking_weights": {g: c.weights for g, c in cals.items()},
+        "ovr_weights": {g: c.ovr_coef for g, c in cals.items()},
+        "stat_cutoff_days": int(data.attrs.get("lag_days", STAT_CUTOFF_DAYS)),
+        "last_update_review": last_update_review(last_players, data),
+        "by_attribute": by_attribute_metrics(scored_pool) if len(scored_pool) else {},
+        "calibration": calibration_report(player_pool) if len(player_pool) else {},
+        "top_features": importances,
     }
 
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump({"groups": groups, "calibration": cals, "version": 2}, MODEL_PATH, compress=3)
+    text = json.dumps(_json_safe(summary), indent=2)
+    SUMMARY_PATH.write_text(text, encoding="utf-8")
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    (PROCESSED_DIR / "backtest_summary.json").write_text(text, encoding="utf-8")
+    logger.info("Model saved to %s", MODEL_PATH)
+    return summary
 
-def save_metrics(metrics: dict, fold: str = "test") -> None:
-    Session = init_db()
-    with Session() as session:
-        for model_name, model_metrics in metrics.items():
-            if isinstance(model_metrics, dict):
-                for metric_name, value in model_metrics.items():
-                    session.add(
-                        ModelMetrics(
-                            model_name=model_name,
-                            metric_name=metric_name,
-                            metric_value=float(value),
-                            fold=fold,
-                        )
-                    )
-            else:
-                session.add(
-                    ModelMetrics(
-                        model_name="ensemble",
-                        metric_name=model_name,
-                        metric_value=float(model_metrics),
-                        fold=fold,
-                    )
-                )
-        session.commit()
+
+def _json_safe(obj):
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, (float, np.floating)):
+        return None if not np.isfinite(obj) else float(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    return obj
+
+
+def load_summary() -> dict:
+    if SUMMARY_PATH.exists():
+        return json.loads(SUMMARY_PATH.read_text(encoding="utf-8"))
+    return {}

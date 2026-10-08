@@ -1,24 +1,24 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from collections import defaultdict
+from functools import lru_cache
 from pathlib import Path
-from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
-from src.db import AttributeChange, CardSnapshot, ModelMetrics, Prediction, init_db, safe_init_db
-from src.features.engineering import build_live_features
-from src.ingest.cards import fetch_live_series_cards, link_cards_to_mlb_ids
-from src.models.predict import is_roster_update_today, run_predictions
+from src.config import quicksell_value
+from src.db import AttributeChange, CardSnapshot, Prediction, safe_init_db
+from src.models.registry import normalize_attr_name
 
 app = FastAPI(
     title="MLB The Show 26 Roster Update Predictor",
-    description="Predict Live Series rating changes from MLB performance stats.",
-    version="1.0.0",
+    description="Predict Live Series attribute updates from MLB performance stats.",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -27,18 +27,92 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 class RefreshRequest(BaseModel):
     game_year: int = 26
-    horizon_days: int = 1
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-CARD_IMG_DIRS = [
-    PROJECT_ROOT / "data" / "card_images_real",   # clean CDN images (preferred)
-    PROJECT_ROOT / "data" / "card_images",          # generated fallback
-]
+STATIC_PREDICTIONS_PATH = PROJECT_ROOT / "data" / "static_predictions.json"
+# Card art is served from The Show's CDN, which re-renders it after every update.
+CARD_ART_URL = "https://cards.theshow.com/mlb26/{uuid}-baked-{size}.webp"
+
+
+@lru_cache(maxsize=1)
+def _static_predictions() -> dict | None:
+    if not STATIC_PREDICTIONS_PATH.exists():
+        return None
+    try:
+        return json.loads(STATIC_PREDICTIONS_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _model_summary() -> dict:
+    from src.models.train import load_summary
+
+    s = load_summary()
+    if not s:
+        return {}
+    return {
+        "trained_on": s.get("trained_on", []),
+        "metrics": s.get("summary", {}),
+        "folds": s.get("folds", []),
+        "ovr_weights": s.get("ovr_weights", {}),
+        "stat_cutoff_days": s.get("stat_cutoff_days"),
+        "last_update_review": s.get("last_update_review", {}),
+        "by_attribute": s.get("by_attribute", {}),
+        "calibration": s.get("calibration", {}),
+    }
+
+
+def _update_status() -> dict:
+    try:
+        from src.models.predict import update_schedule
+        return update_schedule()
+    except Exception as exc:
+        return {"latest": None, "days_since": None, "days_until": None,
+                "next_expected": None, "is_update_today": False, "error": str(exc)}
+
+
+def _serialize(p: Prediction, snap: CardSnapshot | None = None, with_attrs: bool = True) -> dict:
+    out = {
+        "card_uuid": p.card_uuid,
+        "player_name": p.player_name,
+        "mlb_player_id": p.mlb_player_id,
+        "current_ovr": p.current_ovr,
+        "current_rarity": p.current_rarity,
+        "current_qs": quicksell_value(p.current_ovr or 0),
+        "predicted_ovr_delta": p.predicted_ovr_delta,
+        "ovr_delta_sd": p.ovr_delta_sd,
+        "upgrade_probability": p.upgrade_probability or 0.0,
+        "downgrade_probability": p.downgrade_probability or 0.0,
+        "tier_jump_probability": p.tier_jump_probability or 0.0,
+        "tier_down_probability": p.tier_down_probability or 0.0,
+        "gold_probability": p.gold_probability or 0.0,
+        "diamond_probability": p.diamond_probability or 0.0,
+        # P(OVR moves by k) for k in -4..+4; drives the profit calculator.
+        "ovr_move_probs": json.loads(p.ovr_move_probs_json or "[]"),
+        "sample_size_ok": bool(p.sample_size_ok),
+        "avg_gap": p.avg_gap,
+        "direction_consensus": p.direction_consensus,
+        "investment_score": p.investment_score,
+        "expected_value_per_card": p.expected_value_per_card,
+        "roi_pct": p.roi_pct,
+        "created_at": str(p.created_at),
+    }
+    if snap is not None or with_attrs:
+        out.update({
+            "team": snap.team if snap else None,
+            "position": snap.position if snap else None,
+            "is_hitter": snap.is_hitter if snap else None,
+        })
+    if with_attrs:
+        out["attributes"] = json.loads(p.attributes_json or "[]")
+        out["stats"] = json.loads(p.stats_json or "{}")
+    return out
 
 
 @app.get("/health")
@@ -47,309 +121,158 @@ def health():
 
 
 @app.get("/card-image/{card_uuid}")
-def get_card_image(card_uuid: str):
-    for d in CARD_IMG_DIRS:
-        if d.exists():
-            f = d / f"{card_uuid}.png"
-            if f.exists():
-                from fastapi.responses import FileResponse
-                return FileResponse(str(f), media_type="image/png")
-    from fastapi.responses import Response
-    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="400" height="560">
-      <rect width="400" height="560" fill="#1a1a2e" rx="12"/>
-      <text x="200" y="280" text-anchor="middle" fill="#666" font-family="sans-serif" font-size="24">No Image</text>
-    </svg>'''
-    return Response(content=svg, media_type="image/svg+xml")
+def get_card_image(card_uuid: str, size: str = Query("sm", pattern="^(sm|lg)$")):
+    return RedirectResponse(CARD_ART_URL.format(uuid=card_uuid, size=size), status_code=307)
 
 
 @app.get("/dashboard")
-def get_dashboard(horizon_days: int = Query(1, ge=1, le=30)):
+def get_dashboard():
     Session = safe_init_db()
     if Session is None:
-        return {"count": 0, "predictions": [], "update_status": {"latest": None, "days_since": None, "days_until": None}}
-
-    # Static fallback: if no predictions in DB, try loading pre-computed JSON
-    # (generated at build time so the site works immediately on Vercel)
-    _STATIC_PREDICTIONS_PATH = PROJECT_ROOT / "data" / "static_predictions.json"
-    _HAS_CHECKED_STATIC = [False]
-    _STATIC_CACHE = [None]
-
-    if _STATIC_PREDICTIONS_PATH.exists() and not _HAS_CHECKED_STATIC[0]:
-        _HAS_CHECKED_STATIC[0] = True
-        try:
-            _STATIC_CACHE[0] = json.loads(_STATIC_PREDICTIONS_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-
+        return _static_predictions() or {"count": 0, "predictions": [], "update_status": {}, "model": _model_summary()}
     with Session() as session:
-        pred_count = session.query(Prediction).filter(Prediction.horizon_days == horizon_days).count()
-
-    if pred_count == 0 and _STATIC_CACHE[0] is not None:
-        return _STATIC_CACHE[0]
-
-    with Session() as session:
-        predictions = (
-            session.query(Prediction)
-            .filter(Prediction.horizon_days == horizon_days)
-            .all()
-        )
-        card_uuids = [p.card_uuid for p in predictions]
-        snapshots = (
-            session.query(CardSnapshot)
-            .filter(CardSnapshot.card_uuid.in_(card_uuids))
-            .all()
-        )
-        snap_map = {s.card_uuid: s for s in snapshots}
-
-        result = []
-        for p in predictions:
-            s = snap_map.get(p.card_uuid)
-            attrs = json.loads(p.attributes_json or "[]")
-            has_img = any(
-                (d / f"{p.card_uuid}.png").exists()
-                for d in CARD_IMG_DIRS if d.exists()
-            )
-            result.append({
-                "card_uuid": p.card_uuid,
-                "player_name": p.player_name,
-                "mlb_player_id": p.mlb_player_id,
-                "current_ovr": p.current_ovr,
-                "current_rarity": p.current_rarity,
-                "predicted_ovr_delta": p.predicted_ovr_delta,
-                "upgrade_probability": p.upgrade_probability,
-                "downgrade_probability": p.downgrade_probability,
-                "tier_jump_probability": p.tier_jump_probability,
-                "sample_size_ok": bool(p.sample_size_ok),
-                "avg_gap": p.avg_gap,
-                "direction_consensus": p.direction_consensus,
-                "team": s.team if s else None,
-                "position": s.position if s else None,
-                "is_hitter": s.is_hitter if s else None,
-                "has_card_image": has_img,
-                "attributes": attrs,
-                "created_at": str(p.created_at),
-            })
-
-        # Update status
-        status = {"latest": None, "days_since": None, "days_until": None}
-        try:
-            row = session.execute(
-                "SELECT update_date FROM attribute_changes WHERE update_date IS NOT NULL ORDER BY update_date DESC LIMIT 1"
-            ).fetchone()
-            if row:
-                latest = datetime.strptime(str(row[0]), "%Y-%m-%d").date()
-                today = datetime.utcnow().date()
-                days_since = (today - latest).days
-                next_update = latest + timedelta(days=14)
-                days_until = (next_update - today).days
-                status = {
-                    "latest": str(latest),
-                    "days_since": days_since,
-                    "days_until": days_until,
-                    "next_expected": str(next_update),
-                    "is_update_today": days_since == 0,
-                }
-        except Exception:
-            pass
-
-    return {"count": len(result), "predictions": result, "update_status": status}
+        predictions = session.query(Prediction).all()
+        if not predictions:
+            static = _static_predictions()
+            if static is not None:
+                return static
+            return {"count": 0, "predictions": [], "update_status": _update_status(), "model": _model_summary()}
+        snaps = {
+            s.card_uuid: s
+            for s in session.query(CardSnapshot).filter(CardSnapshot.card_uuid.in_([p.card_uuid for p in predictions]))
+        }
+        result = [_serialize(p, snaps.get(p.card_uuid)) for p in predictions]
+    return {
+        "count": len(result),
+        "predictions": result,
+        "update_status": _update_status(),
+        "model": _model_summary(),
+    }
 
 
 @app.get("/update-status")
 def update_status():
-    """
-    Returns whether today has a roster update based on the most recent
-    attribute_changes.update_date. The dashboard uses this to show
-    'UPDATE TODAY' or 'No Update Today'.
-    """
-    return is_roster_update_today()
+    return _update_status()
 
 
 @app.get("/predictions")
 def get_predictions(
-    horizon_days: int = Query(1, ge=1, le=30),
     limit: int = Query(50, ge=1, le=500),
-    min_upgrade_prob: float = Query(0.0, ge=0.0, le=1.0),
+    sort: str = Query("expected_value_per_card", pattern="^(expected_value_per_card|predicted_ovr_delta|upgrade_probability|downgrade_probability)$"),
 ):
     Session = safe_init_db()
     if Session is None:
         return {"count": 0, "predictions": []}
     with Session() as session:
-        q = (
-            session.query(Prediction)
-            .filter(Prediction.horizon_days == horizon_days)
-            .filter(Prediction.upgrade_probability >= min_upgrade_prob)
-            .order_by(Prediction.upgrade_probability.desc())
-            .limit(limit)
-        )
-        rows = [
-            {
-                "player_name": p.player_name,
-                "card_uuid": p.card_uuid,
-                "current_ovr": p.current_ovr,
-                "current_rarity": p.current_rarity,
-                "predicted_ovr_delta": p.predicted_ovr_delta,
-                "upgrade_probability": p.upgrade_probability,
-                "downgrade_probability": p.downgrade_probability,
-                "tier_jump_probability": p.tier_jump_probability,
-                "sample_size_ok": bool(p.sample_size_ok),
-                "avg_gap": p.avg_gap,
-                "direction_consensus": p.direction_consensus,
-                "created_at": str(p.created_at),
-            }
-            for p in q.all()
-        ]
-    return {"count": len(rows), "predictions": rows}
+        rows = session.query(Prediction).order_by(getattr(Prediction, sort).desc()).limit(limit).all()
+        out = [_serialize(p, with_attrs=False) for p in rows]
+    return {"count": len(out), "predictions": out}
 
 
 @app.get("/player/{card_uuid}")
-def get_player(card_uuid: str, horizon_days: int = 1):
+def get_player(card_uuid: str):
     Session = safe_init_db()
     if Session is None:
         raise HTTPException(503, "Database not available")
     with Session() as session:
-        p = (
-            session.query(Prediction)
-            .filter_by(card_uuid=card_uuid, horizon_days=horizon_days)
-            .first()
-        )
+        p = session.query(Prediction).filter_by(card_uuid=card_uuid).first()
         if not p:
             raise HTTPException(404, "Player prediction not found")
-        attrs = json.loads(p.attributes_json or "[]")
-        return {
-            "player_name": p.player_name,
-            "card_uuid": p.card_uuid,
-            "current_ovr": p.current_ovr,
-            "current_rarity": p.current_rarity,
-            "predicted_ovr_delta": p.predicted_ovr_delta,
-            "upgrade_probability": p.upgrade_probability,
-            "downgrade_probability": p.downgrade_probability,
-            "tier_jump_probability": p.tier_jump_probability,
-            "avg_gap": p.avg_gap,
-            "direction_consensus": p.direction_consensus,
-            "attributes": attrs,
-        }
+        snap = session.query(CardSnapshot).filter_by(card_uuid=card_uuid).first()
+        return _serialize(p, snap)
 
 
 @app.get("/accuracy")
 def get_accuracy():
-    Session = safe_init_db()
-    if Session is None:
-        return {"metrics": []}
-    with Session() as session:
-        metrics = session.query(ModelMetrics).order_by(ModelMetrics.created_at.desc()).limit(50).all()
-        return {
-            "metrics": [
-                {
-                    "model": m.model_name,
-                    "metric": m.metric_name,
-                    "value": m.metric_value,
-                    "fold": m.fold,
-                }
-                for m in metrics
-            ]
-        }
+    """Walk-forward backtest results for the current model."""
+    return _model_summary()
 
 
 @app.get("/player-search")
 def player_search(q: str = Query(..., min_length=1, description="Player name search term")):
-    """
-    Search for players by name. Returns matching players with their
-    latest prediction data (T-1 horizon by default).
-    """
     Session = safe_init_db()
     if Session is None:
         return {"query": q, "count": 0, "results": []}
     with Session() as session:
-        # Find distinct players matching the name
         players = (
             session.query(Prediction)
             .filter(Prediction.player_name.ilike(f"%{q}%"))
-            .filter(Prediction.horizon_days == 1)
-            .order_by(Prediction.upgrade_probability.desc())
+            .order_by(Prediction.expected_value_per_card.desc())
             .limit(50)
             .all()
         )
-        results = [
-            {
-                "player_name": p.player_name,
-                "card_uuid": p.card_uuid,
-                "mlb_player_id": p.mlb_player_id,
-                "current_ovr": p.current_ovr,
-                "current_rarity": p.current_rarity,
-                "predicted_ovr_delta": p.predicted_ovr_delta,
-                "upgrade_probability": p.upgrade_probability,
-                "downgrade_probability": p.downgrade_probability,
-                "tier_jump_probability": p.tier_jump_probability,
-                "avg_gap": p.avg_gap,
-                "direction_consensus": p.direction_consensus,
-                "created_at": str(p.created_at),
-            }
-            for p in players
-        ]
+        results = [_serialize(p, with_attrs=False) for p in players]
     return {"query": q, "count": len(results), "results": results}
 
 
-@app.get("/player-trend/{mlb_id}")
-def player_trend(mlb_id: int):
-    """
-    Return the last 5 rating changes per attribute for a player (by MLB ID).
-    Returns a dict keyed with attribute_name -> list of recent changes
-    (most recent first), each with rating_before, rating_after, delta, update_date.
-    """
+@app.get("/player-history/{card_uuid}")
+def player_history(card_uuid: str, limit: int = Query(8, ge=1, le=30)):
+    """Past attribute changes for a card, grouped by update (most recent first)."""
     Session = safe_init_db()
     if Session is None:
         raise HTTPException(503, "Database not available")
     with Session() as session:
-        # Get all attribute changes for this player, ordered most recent first
+        changes = (
+            session.query(AttributeChange)
+            .filter(AttributeChange.card_uuid == card_uuid)
+            .order_by(AttributeChange.update_date.desc(), AttributeChange.id)
+            .all()
+        )
+    by_update: dict[str, dict] = {}
+    for c in changes:
+        u = by_update.setdefault(c.update_date, {
+            "update_date": c.update_date, "update_name": c.update_name,
+            "ovr_before": c.ovr_before, "ovr_after": c.ovr_after, "changes": [],
+        })
+        u["changes"].append({
+            "attribute": normalize_attr_name(c.attribute_name or "", 26),
+            "rating_before": c.rating_before, "rating_after": c.rating_after, "delta": c.delta,
+        })
+    return {"card_uuid": card_uuid, "updates": list(by_update.values())[:limit]}
+
+
+@app.get("/player-trend/{mlb_id}")
+def player_trend(mlb_id: int):
+    """Last 5 rating changes per attribute for a player (by MLB ID)."""
+    Session = safe_init_db()
+    if Session is None:
+        raise HTTPException(503, "Database not available")
+    with Session() as session:
         changes = (
             session.query(AttributeChange)
             .filter(AttributeChange.mlb_player_id == mlb_id)
             .order_by(AttributeChange.update_date.desc(), AttributeChange.id.desc())
             .all()
         )
-
-        if not changes:
-            raise HTTPException(404, f"No historical data for MLB player ID {mlb_id}")
-
-        # Group by attribute, keep last 5 per attribute
-        from collections import defaultdict
-        trend: dict[str, list[dict]] = defaultdict(list)
-        player_name = changes[0].player_name
-        for c in changes:
-            attr = c.attribute_name
-            if len(trend[attr]) < 5:
-                trend[attr].append({
-                    "attribute": attr,
-                    "rating_before": c.rating_before,
-                    "rating_after": c.rating_after,
-                    "delta": c.delta,
-                    "update_date": c.update_date,
-                    "update_name": c.update_name,
-                })
-
-    return {
-        "mlb_player_id": mlb_id,
-        "player_name": player_name,
-        "trend": dict(trend),
-    }
+    if not changes:
+        raise HTTPException(404, f"No historical data for MLB player ID {mlb_id}")
+    trend: dict[str, list[dict]] = defaultdict(list)
+    for c in changes:
+        attr = normalize_attr_name(c.attribute_name or "", c.game_year)
+        if len(trend[attr]) < 5:
+            trend[attr].append({
+                "attribute": attr,
+                "rating_before": c.rating_before,
+                "rating_after": c.rating_after,
+                "delta": c.delta,
+                "update_date": c.update_date,
+                "update_name": c.update_name,
+            })
+    return {"mlb_player_id": mlb_id, "player_name": changes[0].player_name, "trend": dict(trend)}
 
 
 @app.get("/history/changes")
-def get_historical_changes(limit: int = 100):
-    Session = init_db()
+def get_historical_changes(limit: int = Query(100, ge=1, le=1000)):
+    Session = safe_init_db()
+    if Session is None:
+        return {"changes": []}
     with Session() as session:
-        changes = (
-            session.query(AttributeChange)
-            .order_by(AttributeChange.id.desc())
-            .limit(limit)
-            .all()
-        )
+        changes = session.query(AttributeChange).order_by(AttributeChange.id.desc()).limit(limit).all()
         return {
             "changes": [
                 {
                     "player_name": c.player_name,
-                    "attribute": c.attribute_name,
+                    "attribute": normalize_attr_name(c.attribute_name or "", c.game_year),
                     "delta": c.delta,
                     "update": c.update_name,
                     "game_year": c.game_year,
@@ -361,6 +284,8 @@ def get_historical_changes(limit: int = 100):
 
 @app.post("/refresh/cards")
 def refresh_cards(game_year: int = 26):
+    from src.ingest.cards import fetch_live_series_cards, link_cards_to_mlb_ids
+
     stats = fetch_live_series_cards(game_year=game_year)
     linked = link_cards_to_mlb_ids(game_year=game_year)
     return {"cards": stats, "linked": linked}
@@ -368,18 +293,17 @@ def refresh_cards(game_year: int = 26):
 
 @app.post("/refresh/predictions")
 def refresh_predictions(req: RefreshRequest):
-    live_df = build_live_features(game_year=req.game_year, horizon_days=req.horizon_days)
-    preds = run_predictions(live_df, horizon_days=req.horizon_days)
+    from src.features.dataset import build_live_dataset
+    from src.models.predict import run_predictions
+
+    preds = run_predictions(build_live_dataset(req.game_year))
     return {"scored": len(preds)}
 
 
 @app.post("/train")
-def train_models():
+def train_models(game_year: int = 26):
+    from src.features.dataset import build_training_dataset
     from src.models.train import train_all
-    result = train_all()
-    try:
-        from src.models.evaluate import run_backtest
-        backtest = run_backtest()
-    except Exception as e:
-        backtest = {"error": str(e)}
-    return {"training": result, "backtest": backtest}
+
+    summary = train_all(build_training_dataset(game_year))
+    return {"trained_on": summary["trained_on"], "metrics": summary["summary"]}

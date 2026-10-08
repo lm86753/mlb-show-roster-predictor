@@ -70,22 +70,22 @@ def parse_delta(delta_str: str) -> int:
 
 
 
+_NON_ATTRIBUTE_INT_FIELDS = {
+    "ovr", "age", "series_year", "jersey_number", "ui_anim_index", "stars",
+    "new_rank", "two_way",
+}
+
+
 def extract_card_attributes(item: dict) -> dict[str, int]:
-    attrs = {}
-    for key, val in item.items():
-        if isinstance(val, int) and key not in {
-            "ovr", "age", "stamina", "series_year", "jersey_number", "ui_anim_index",
-        }:
-            if any(
-                key.startswith(p)
-                for p in (
-                    "contact_", "power_", "plate_", "batting_", "bunting_", "drag_",
-                    "fielding_", "arm_", "blocking", "speed", "baserunning_",
-                    "pitch_", "bb_per_", "hr_per_", "hitting_", "pitching_",
-                )
-            ):
-                attrs[key] = val
-    return attrs
+    """Every integer rating on an SDS card item (contact_left, stamina,
+    hits_per_bf_right, k_per_bf_left, ...), keyed by the SDS field name."""
+    return {
+        key: val
+        for key, val in item.items()
+        if isinstance(val, int)
+        and not isinstance(val, bool)
+        and key not in _NON_ATTRIBUTE_INT_FIELDS
+    }
 
 
 def parse_attribute_changes(
